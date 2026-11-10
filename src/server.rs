@@ -88,7 +88,8 @@ impl TlsListener {
                 let acceptor = acceptor.clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+                    {
                         Ok(Ok(tls)) => {
                             let _ = tx.send((tls, addr)).await;
                         }
@@ -126,7 +127,10 @@ fn load_tls(files: &TlsFiles) -> anyhow::Result<Arc<rustls::ServerConfig>> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("MPC_RELAY_TLS_CERT {}: {e}", files.cert.display()))?;
     if certs.is_empty() {
-        anyhow::bail!("MPC_RELAY_TLS_CERT {}: no certificates found", files.cert.display());
+        anyhow::bail!(
+            "MPC_RELAY_TLS_CERT {}: no certificates found",
+            files.cert.display()
+        );
     }
     let key = PrivateKeyDer::from_pem_file(&files.key)
         .map_err(|e| anyhow::anyhow!("MPC_RELAY_TLS_KEY {}: {e}", files.key.display()))?;
@@ -339,7 +343,11 @@ impl Relay {
         let grace = self.shared.config.shutdown_grace;
         self.shared.draining.store(true, Ordering::Release);
         self.drain.cancel();
-        tracing::info!(active = self.shared.active_connections(), ?grace, "draining");
+        tracing::info!(
+            active = self.shared.active_connections(),
+            ?grace,
+            "draining"
+        );
         wait_for_idle(&self.shared, grace).await;
         self.shared.shutdown.cancel();
         wait_for_idle(&self.shared, Duration::from_secs(15)).await;

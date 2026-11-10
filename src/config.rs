@@ -172,7 +172,11 @@ pub struct Config {
 impl Config {
     /// A configuration with defaults for everything optional. Used by tests
     /// and by `from_vars` as its starting point.
-    pub fn new(amqp_url: impl Into<String>, exchange: impl Into<String>, source: KeySource) -> Self {
+    pub fn new(
+        amqp_url: impl Into<String>,
+        exchange: impl Into<String>,
+        source: KeySource,
+    ) -> Self {
         Config {
             listen: "0.0.0.0:8080".parse().expect("static address"),
             ws_path: "/ws".into(),
@@ -227,7 +231,8 @@ impl Config {
         }
         let get = |name: &'static str| env.get(name).cloned();
 
-        let amqp_url = get("MPC_RELAY_AMQP_URL").ok_or(ConfigError::Missing("MPC_RELAY_AMQP_URL"))?;
+        let amqp_url =
+            get("MPC_RELAY_AMQP_URL").ok_or(ConfigError::Missing("MPC_RELAY_AMQP_URL"))?;
         if !(amqp_url.starts_with("amqp://") || amqp_url.starts_with("amqps://")) {
             return Err(invalid(
                 "MPC_RELAY_AMQP_URL",
@@ -238,7 +243,8 @@ impl Config {
             .parse::<lapin::uri::AMQPUri>()
             .map_err(|e| invalid("MPC_RELAY_AMQP_URL", e))?;
 
-        let exchange = get("MPC_RELAY_EXCHANGE").ok_or(ConfigError::Missing("MPC_RELAY_EXCHANGE"))?;
+        let exchange =
+            get("MPC_RELAY_EXCHANGE").ok_or(ConfigError::Missing("MPC_RELAY_EXCHANGE"))?;
         validate_exchange(&exchange).map_err(|r| invalid("MPC_RELAY_EXCHANGE", r))?;
 
         // Exactly one key source.
@@ -292,7 +298,11 @@ impl Config {
             validate_jwks_url(&url, allow_http).map_err(|r| invalid("MPC_RELAY_JWKS_URL", r))?;
             KeySource::Jwks {
                 url,
-                refresh_interval: duration_or(&env, "MPC_RELAY_JWKS_REFRESH_INTERVAL", Duration::from_secs(300))?,
+                refresh_interval: duration_or(
+                    &env,
+                    "MPC_RELAY_JWKS_REFRESH_INTERVAL",
+                    Duration::from_secs(300),
+                )?,
                 min_refresh_interval: duration_or(
                     &env,
                     "MPC_RELAY_JWKS_MIN_REFRESH_INTERVAL",
@@ -317,17 +327,28 @@ impl Config {
         let mut cfg = Config::new(amqp_url, exchange, source);
 
         if let Some(v) = get("MPC_RELAY_LISTEN") {
-            cfg.listen = v.parse().map_err(|e| invalid("MPC_RELAY_LISTEN", format!("{e}")))?;
+            cfg.listen = v
+                .parse()
+                .map_err(|e| invalid("MPC_RELAY_LISTEN", format!("{e}")))?;
         }
         if let Some(v) = get("MPC_RELAY_METRICS_LISTEN") {
-            cfg.metrics_listen = Some(v.parse().map_err(|e| invalid("MPC_RELAY_METRICS_LISTEN", format!("{e}")))?);
+            cfg.metrics_listen = Some(
+                v.parse()
+                    .map_err(|e| invalid("MPC_RELAY_METRICS_LISTEN", format!("{e}")))?,
+            );
         }
         if let Some(v) = get("MPC_RELAY_WS_PATH") {
             if !v.starts_with('/') || v.contains(['?', '#', ' ']) {
-                return Err(invalid("MPC_RELAY_WS_PATH", "must be an absolute path such as /ws"));
+                return Err(invalid(
+                    "MPC_RELAY_WS_PATH",
+                    "must be an absolute path such as /ws",
+                ));
             }
             if ["/healthz", "/readyz", "/metrics"].contains(&v.as_str()) {
-                return Err(invalid("MPC_RELAY_WS_PATH", "collides with an HTTP endpoint"));
+                return Err(invalid(
+                    "MPC_RELAY_WS_PATH",
+                    "collides with an HTTP endpoint",
+                ));
             }
             cfg.ws_path = v;
         }
@@ -354,7 +375,10 @@ impl Config {
         if let Some(v) = get("MPC_RELAY_JWT_MAX_TTL") {
             let d = parse_duration(&v).map_err(|r| invalid("MPC_RELAY_JWT_MAX_TTL", r))?;
             if d.is_zero() {
-                return Err(invalid("MPC_RELAY_JWT_MAX_TTL", "must be greater than zero"));
+                return Err(invalid(
+                    "MPC_RELAY_JWT_MAX_TTL",
+                    "must be greater than zero",
+                ));
             }
             cfg.auth.max_ttl = Some(d);
         }
@@ -364,7 +388,10 @@ impl Config {
         l.max_subscriptions = positive(&env, "MPC_RELAY_MAX_SUBSCRIPTIONS", l.max_subscriptions)?;
         l.max_frame_bytes = positive(&env, "MPC_RELAY_MAX_FRAME_BYTES", l.max_frame_bytes)?;
         if l.max_frame_bytes < 1024 {
-            return Err(invalid("MPC_RELAY_MAX_FRAME_BYTES", "must be at least 1024"));
+            return Err(invalid(
+                "MPC_RELAY_MAX_FRAME_BYTES",
+                "must be at least 1024",
+            ));
         }
         l.send_rate = positive::<u32>(&env, "MPC_RELAY_SEND_RATE", l.send_rate as u32)? as f64;
         l.send_burst = positive(&env, "MPC_RELAY_SEND_BURST", l.send_burst)?;
@@ -478,7 +505,11 @@ fn nonzero_duration(
     Ok(d)
 }
 
-fn positive<T>(env: &BTreeMap<String, String>, var: &'static str, default: T) -> Result<T, ConfigError>
+fn positive<T>(
+    env: &BTreeMap<String, String>,
+    var: &'static str,
+    default: T,
+) -> Result<T, ConfigError>
 where
     T: std::str::FromStr + PartialOrd + Default,
 {

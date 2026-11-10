@@ -35,7 +35,10 @@ uuid = "1"
 
 [dev-dependencies]
 aws-lc-rs = "1"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 tokio-tungstenite = "0.29"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 lto = "thin"

@@ -300,28 +300,26 @@ impl Decoder {
                             }
                             (body_end, body_end + 1)
                         }
-                        None => {
-                            match self.buf[*scanned..].iter().position(|b| *b == 0) {
-                                Some(rel) => {
-                                    let nul = *scanned + rel;
-                                    if nul + 1 > self.max_frame {
-                                        return Err(CodecError::FrameTooLarge {
-                                            limit: self.max_frame,
-                                        });
-                                    }
-                                    (nul, nul + 1)
+                        None => match self.buf[*scanned..].iter().position(|b| *b == 0) {
+                            Some(rel) => {
+                                let nul = *scanned + rel;
+                                if nul + 1 > self.max_frame {
+                                    return Err(CodecError::FrameTooLarge {
+                                        limit: self.max_frame,
+                                    });
                                 }
-                                None => {
-                                    *scanned = self.buf.len();
-                                    if self.buf.len() > self.max_frame {
-                                        return Err(CodecError::FrameTooLarge {
-                                            limit: self.max_frame,
-                                        });
-                                    }
-                                    return Ok(None);
-                                }
+                                (nul, nul + 1)
                             }
-                        }
+                            None => {
+                                *scanned = self.buf.len();
+                                if self.buf.len() > self.max_frame {
+                                    return Err(CodecError::FrameTooLarge {
+                                        limit: self.max_frame,
+                                    });
+                                }
+                                return Ok(None);
+                            }
+                        },
                     };
                     let frame_bytes = self.buf.split_to(frame_end).freeze();
                     let frame = Frame {
@@ -337,7 +335,10 @@ impl Decoder {
     }
 }
 
-fn content_length(headers: &[(String, String)], max_frame: usize) -> Result<Option<usize>, CodecError> {
+fn content_length(
+    headers: &[(String, String)],
+    max_frame: usize,
+) -> Result<Option<usize>, CodecError> {
     let Some((_, v)) = headers.iter().find(|(k, _)| k == "content-length") else {
         return Ok(None);
     };

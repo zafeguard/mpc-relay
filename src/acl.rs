@@ -143,7 +143,9 @@ pub fn parse_routing_key(key: &str) -> Result<RoutingKey, AclError> {
     if key.len() > MAX_SHORTSTR {
         return Err(AclError::TooLong);
     }
-    let rest = key.strip_prefix("session.").ok_or(AclError::BadRoutingKey)?;
+    let rest = key
+        .strip_prefix("session.")
+        .ok_or(AclError::BadRoutingKey)?;
     if rest.len() < 37 || !rest.is_char_boundary(36) || rest.as_bytes()[36] != b'.' {
         return Err(AclError::BadRoutingKey);
     }

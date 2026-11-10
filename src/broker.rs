@@ -156,7 +156,11 @@ impl Broker {
                     });
                     let stopped = self.hold(&conn, &exchange, &lost, &stop).await;
                     if stopped {
-                        let _ = tokio::time::timeout(OP_TIMEOUT, conn.close(200, "mpc-relay shutting down")).await;
+                        let _ = tokio::time::timeout(
+                            OP_TIMEOUT,
+                            conn.close(200, "mpc-relay shutting down"),
+                        )
+                        .await;
                     }
                     metrics.broker_connected.set(0);
                     self.state.send_replace(BrokerState {
@@ -209,7 +213,10 @@ impl Broker {
                     if ok {
                         tracing::info!(exchange, "exchange exists; ready");
                     } else {
-                        tracing::warn!(exchange, "exchange does not exist (the agents declare it); not ready");
+                        tracing::warn!(
+                            exchange,
+                            "exchange does not exist (the agents declare it); not ready"
+                        );
                     }
                 }
                 next_check = tokio::time::Instant::now()

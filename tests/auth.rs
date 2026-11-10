@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{EcdsaKeyPair, Ed25519KeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use aws_lc_rs::signature::{
+    EcdsaKeyPair, Ed25519KeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
+};
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -61,7 +63,9 @@ fn raw_token(header: &Value, claims: &Value, sig: &[u8]) -> String {
 }
 
 async fn check(a: &Authenticator, token: &str) -> Result<String, AuthError> {
-    a.authenticate(None, Some(token)).await.map(|i| i.principal.sub)
+    a.authenticate(None, Some(token))
+        .await
+        .map(|i| i.principal.sub)
 }
 
 // ---- HMAC -----------------------------------------------------------------
@@ -96,7 +100,10 @@ async fn tampered_payload() {
     let t = hs_token(Algorithm::HS256, &claims("device-1", 300));
     let mut parts: Vec<String> = t.split('.').map(str::to_owned).collect();
     parts[1] = B64.encode(claims("device-2", 300).to_string());
-    assert_eq!(check(&a, &parts.join(".")).await, Err(AuthError::BadSignature));
+    assert_eq!(
+        check(&a, &parts.join(".")).await,
+        Err(AuthError::BadSignature)
+    );
 }
 
 #[tokio::test]
@@ -113,12 +120,24 @@ async fn expired_and_leeway() {
 async fn nbf_honoured() {
     let a = hs_default();
     let now = unix_now() as i64;
-    let early = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 600, "nbf": now + 120}));
+    let early = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 600, "nbf": now + 120}),
+    );
     assert_eq!(check(&a, &early).await, Err(AuthError::NotYetValid));
-    let ok = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 600, "nbf": now + 10}));
+    let ok = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 600, "nbf": now + 10}),
+    );
     assert!(check(&a, &ok).await.is_ok());
-    let bad_type = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 600, "nbf": "soon"}));
-    assert_eq!(check(&a, &bad_type).await, Err(AuthError::InvalidClaim("nbf".into())));
+    let bad_type = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 600, "nbf": "soon"}),
+    );
+    assert_eq!(
+        check(&a, &bad_type).await,
+        Err(AuthError::InvalidClaim("nbf".into()))
+    );
 }
 
 #[tokio::test]
@@ -127,12 +146,21 @@ async fn issuer_checked_when_configured() {
     cfg.issuer = Some("https://issuer.example".into());
     let a = hs(cfg);
     let now = unix_now() as i64;
-    let right = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60, "iss": "https://issuer.example"}));
-    let wrong = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60, "iss": "https://evil.example"}));
+    let right = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 60, "iss": "https://issuer.example"}),
+    );
+    let wrong = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 60, "iss": "https://evil.example"}),
+    );
     let missing = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60}));
     assert!(check(&a, &right).await.is_ok());
     assert_eq!(check(&a, &wrong).await, Err(AuthError::BadIssuer));
-    assert_eq!(check(&a, &missing).await, Err(AuthError::MissingClaim("iss".into())));
+    assert_eq!(
+        check(&a, &missing).await,
+        Err(AuthError::MissingClaim("iss".into()))
+    );
 }
 
 #[tokio::test]
@@ -141,14 +169,26 @@ async fn audience_checked_when_configured() {
     cfg.audience = Some("mpc-relay".into());
     let a = hs(cfg);
     let now = unix_now() as i64;
-    let right = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60, "aud": "mpc-relay"}));
-    let in_list = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60, "aud": ["x", "mpc-relay"]}));
-    let wrong = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60, "aud": "other"}));
+    let right = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 60, "aud": "mpc-relay"}),
+    );
+    let in_list = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 60, "aud": ["x", "mpc-relay"]}),
+    );
+    let wrong = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 60, "aud": "other"}),
+    );
     let missing = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60}));
     assert!(check(&a, &right).await.is_ok());
     assert!(check(&a, &in_list).await.is_ok());
     assert_eq!(check(&a, &wrong).await, Err(AuthError::BadAudience));
-    assert_eq!(check(&a, &missing).await, Err(AuthError::MissingClaim("aud".into())));
+    assert_eq!(
+        check(&a, &missing).await,
+        Err(AuthError::MissingClaim("aud".into()))
+    );
     // Not configured: an aud claim is not a reason to reject.
     let b = hs_default();
     assert!(check(&b, &wrong).await.is_ok());
@@ -159,9 +199,15 @@ async fn required_claims() {
     let a = hs_default();
     let now = unix_now() as i64;
     let no_sub = hs_token(Algorithm::HS256, &json!({"exp": now + 60}));
-    assert_eq!(check(&a, &no_sub).await, Err(AuthError::MissingClaim("sub".into())));
+    assert_eq!(
+        check(&a, &no_sub).await,
+        Err(AuthError::MissingClaim("sub".into()))
+    );
     let no_exp = hs_token(Algorithm::HS256, &json!({"sub": "d"}));
-    assert_eq!(check(&a, &no_exp).await, Err(AuthError::MissingClaim("exp".into())));
+    assert_eq!(
+        check(&a, &no_exp).await,
+        Err(AuthError::MissingClaim("exp".into()))
+    );
     let numeric_sub = hs_token(Algorithm::HS256, &json!({"sub": 7, "exp": now + 60}));
     assert!(check(&a, &numeric_sub).await.is_err());
     let string_exp = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": "never"}));
@@ -186,7 +232,11 @@ async fn alg_none_is_refused() {
         let t = raw_token(&json!({"alg": alg, "typ": "JWT"}), &claims("d", 60), b"");
         assert_eq!(check(&a, &t).await, Err(AuthError::BadAlgorithm), "{alg}");
         // Also with the signature segment omitted entirely.
-        let t = format!("{}.{}.", B64.encode(json!({"alg": alg}).to_string()), B64.encode(claims("d", 60).to_string()));
+        let t = format!(
+            "{}.{}.",
+            B64.encode(json!({"alg": alg}).to_string()),
+            B64.encode(claims("d", 60).to_string())
+        );
         assert_eq!(check(&a, &t).await, Err(AuthError::BadAlgorithm), "{alg}");
     }
     let no_alg = raw_token(&json!({"typ": "JWT"}), &claims("d", 60), b"x");
@@ -198,7 +248,12 @@ async fn hmac_source_refuses_asymmetric_algorithms() {
     let a = hs_default();
     let rng = SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-    let t = encode(&Header::new(Algorithm::ES256), &claims("d", 60), &EncodingKey::from_ec_der(pkcs8.as_ref())).unwrap();
+    let t = encode(
+        &Header::new(Algorithm::ES256),
+        &claims("d", 60),
+        &EncodingKey::from_ec_der(pkcs8.as_ref()),
+    )
+    .unwrap();
     assert_eq!(check(&a, &t).await, Err(AuthError::BadAlgorithm));
     for alg in ["RS256", "PS256", "EdDSA", "ES384", "XS256"] {
         let t = raw_token(&json!({"alg": alg}), &claims("d", 60), b"sig");
@@ -209,21 +264,36 @@ async fn hmac_source_refuses_asymmetric_algorithms() {
 #[tokio::test]
 async fn crit_header_is_refused() {
     let a = hs_default();
-    let t = raw_token(&json!({"alg": "HS256", "crit": ["b64"]}), &claims("d", 60), b"x");
+    let t = raw_token(
+        &json!({"alg": "HS256", "crit": ["b64"]}),
+        &claims("d", 60),
+        b"x",
+    );
     assert_eq!(check(&a, &t).await, Err(AuthError::UnsupportedHeader));
 }
 
 #[tokio::test]
 async fn malformed_tokens() {
     let a = hs_default();
-    for t in ["", "   ", "abc", "a.b", "a.b.c.d", "!!!.###.$$$", &"a".repeat(20_000)] {
+    for t in [
+        "",
+        "   ",
+        "abc",
+        "a.b",
+        "a.b.c.d",
+        "!!!.###.$$$",
+        &"a".repeat(20_000),
+    ] {
         let r = check(&a, t).await;
         assert!(
             matches!(r, Err(AuthError::Malformed | AuthError::MissingToken)),
             "{t:.20}: {r:?}"
         );
     }
-    assert_eq!(a.authenticate(None, None).await.unwrap_err(), AuthError::MissingToken);
+    assert_eq!(
+        a.authenticate(None, None).await.unwrap_err(),
+        AuthError::MissingToken
+    );
 }
 
 #[tokio::test]
@@ -232,15 +302,27 @@ async fn max_ttl() {
     cfg.max_ttl = Some(Duration::from_secs(600));
     let a = hs(cfg);
     let now = unix_now() as i64;
-    let ok = hs_token(Algorithm::HS256, &json!({"sub": "d", "iat": now, "exp": now + 600}));
+    let ok = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "iat": now, "exp": now + 600}),
+    );
     assert!(check(&a, &ok).await.is_ok());
-    let long = hs_token(Algorithm::HS256, &json!({"sub": "d", "iat": now, "exp": now + 601}));
+    let long = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "iat": now, "exp": now + 601}),
+    );
     assert_eq!(check(&a, &long).await, Err(AuthError::TtlTooLong));
     let no_iat = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60}));
-    assert_eq!(check(&a, &no_iat).await, Err(AuthError::MissingClaim("iat".into())));
+    assert_eq!(
+        check(&a, &no_iat).await,
+        Err(AuthError::MissingClaim("iat".into()))
+    );
     // A future iat does not stretch the window: the token is refused as
     // issued in the future before the lifetime check.
-    let future = hs_token(Algorithm::HS256, &json!({"sub": "d", "iat": now + 3600, "exp": now + 3900}));
+    let future = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "iat": now + 3600, "exp": now + 3900}),
+    );
     assert_eq!(check(&a, &future).await, Err(AuthError::IssuedInFuture));
 }
 
@@ -248,7 +330,10 @@ async fn max_ttl() {
 async fn iat_in_future() {
     let a = hs_default();
     let now = unix_now() as i64;
-    let t = hs_token(Algorithm::HS256, &json!({"sub": "d", "iat": now + 120, "exp": now + 600}));
+    let t = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "iat": now + 120, "exp": now + 600}),
+    );
     assert_eq!(check(&a, &t).await, Err(AuthError::IssuedInFuture));
 }
 
@@ -257,16 +342,44 @@ async fn sessions_claim() {
     let a = hs_default();
     let now = unix_now() as i64;
     let upper = S.to_uppercase();
-    let t = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60, "sessions": [upper, "11111111-2222-4333-8444-555555555555"]}));
+    let t = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 60, "sessions": [upper, "11111111-2222-4333-8444-555555555555"]}),
+    );
     let id = a.authenticate(None, Some(&t)).await.unwrap();
     let sessions = id.principal.sessions.unwrap();
     assert!(sessions.contains(S), "canonicalised to lowercase");
     assert_eq!(sessions.len(), 2);
-    let empty = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60, "sessions": []}));
-    assert_eq!(a.authenticate(None, Some(&empty)).await.unwrap().principal.sessions.unwrap().len(), 0);
-    for bad in [json!(null), json!("not-an-array"), json!([1]), json!(["not-a-uuid"]), json!({})] {
-        let t = hs_token(Algorithm::HS256, &json!({"sub": "d", "exp": now + 60, "sessions": bad}));
-        assert_eq!(check(&a, &t).await, Err(AuthError::InvalidClaim("sessions".into())), "{bad}");
+    let empty = hs_token(
+        Algorithm::HS256,
+        &json!({"sub": "d", "exp": now + 60, "sessions": []}),
+    );
+    assert_eq!(
+        a.authenticate(None, Some(&empty))
+            .await
+            .unwrap()
+            .principal
+            .sessions
+            .unwrap()
+            .len(),
+        0
+    );
+    for bad in [
+        json!(null),
+        json!("not-an-array"),
+        json!([1]),
+        json!(["not-a-uuid"]),
+        json!({}),
+    ] {
+        let t = hs_token(
+            Algorithm::HS256,
+            &json!({"sub": "d", "exp": now + 60, "sessions": bad}),
+        );
+        assert_eq!(
+            check(&a, &t).await,
+            Err(AuthError::InvalidClaim("sessions".into())),
+            "{bad}"
+        );
     }
 }
 
@@ -278,7 +391,10 @@ async fn disabled_mode_uses_login() {
     assert_eq!(id.principal.sub, "dev-node");
     assert_eq!(id.expires_at, None);
     assert!(a.authenticate(None, Some("anything")).await.is_err());
-    assert_eq!(a.authenticate(Some("a b"), None).await.unwrap_err(), AuthError::InvalidSub);
+    assert_eq!(
+        a.authenticate(Some("a b"), None).await.unwrap_err(),
+        AuthError::InvalidSub
+    );
 }
 
 #[test]
@@ -312,7 +428,10 @@ impl Keys {
                 .unwrap()
                 .as_ref()
                 .to_vec(),
-            ed_pkcs8: Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref().to_vec(),
+            ed_pkcs8: Ed25519KeyPair::generate_pkcs8(&rng)
+                .unwrap()
+                .as_ref()
+                .to_vec(),
         }
     }
 
@@ -326,7 +445,11 @@ impl Keys {
     }
 
     fn rsa_n(&self) -> Vec<u8> {
-        self.rsa.public_key().modulus().big_endian_without_leading_zero().to_vec()
+        self.rsa
+            .public_key()
+            .modulus()
+            .big_endian_without_leading_zero()
+            .to_vec()
     }
 
     fn rsa_jwk(&self, kid: &str) -> Value {
@@ -339,7 +462,8 @@ impl Keys {
     }
 
     fn ec_jwk(&self, kid: &str) -> Value {
-        let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &self.ec_pkcs8).unwrap();
+        let kp =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &self.ec_pkcs8).unwrap();
         let point = kp.public_key().as_ref();
         assert_eq!(point.len(), 65);
         json!({
@@ -375,10 +499,12 @@ impl JwksServer {
         let app = Router::new()
             .route(
                 "/jwks.json",
-                get(|State((doc, hits)): State<(Arc<Mutex<Value>>, Arc<AtomicU64>)>| async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    Json(doc.lock().unwrap().clone())
-                }),
+                get(
+                    |State((doc, hits)): State<(Arc<Mutex<Value>>, Arc<AtomicU64>)>| async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(doc.lock().unwrap().clone())
+                    },
+                ),
             )
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -419,17 +545,33 @@ async fn jwks_auth(server: &JwksServer, min_refresh: Duration) -> Arc<Authentica
 #[tokio::test]
 async fn jwks_rs256_es256_eddsa_accepted() {
     let k = Keys::generate();
-    let server = JwksServer::start(json!({"keys": [k.rsa_jwk("r1"), k.ec_jwk("e1"), k.ed_jwk("d1")]})).await;
+    let server =
+        JwksServer::start(json!({"keys": [k.rsa_jwk("r1"), k.ec_jwk("e1"), k.ed_jwk("d1")]})).await;
     let a = jwks_auth(&server, Duration::from_secs(60)).await;
     let c = claims("device-9", 300);
     let rs = signed(Algorithm::RS256, Some("r1"), &k.rsa_encoding(), &c);
-    let es = signed(Algorithm::ES256, Some("e1"), &EncodingKey::from_ec_der(&k.ec_pkcs8), &c);
-    let ed = signed(Algorithm::EdDSA, Some("d1"), &EncodingKey::from_ed_der(&k.ed_pkcs8), &c);
+    let es = signed(
+        Algorithm::ES256,
+        Some("e1"),
+        &EncodingKey::from_ec_der(&k.ec_pkcs8),
+        &c,
+    );
+    let ed = signed(
+        Algorithm::EdDSA,
+        Some("d1"),
+        &EncodingKey::from_ed_der(&k.ed_pkcs8),
+        &c,
+    );
     for t in [&rs, &es, &ed] {
         assert_eq!(check(&a, t).await.as_deref(), Ok("device-9"));
     }
     // No kid: tried against the keys of the right type.
-    let es_nokid = signed(Algorithm::ES256, None, &EncodingKey::from_ec_der(&k.ec_pkcs8), &c);
+    let es_nokid = signed(
+        Algorithm::ES256,
+        None,
+        &EncodingKey::from_ec_der(&k.ec_pkcs8),
+        &c,
+    );
     assert_eq!(check(&a, &es_nokid).await.as_deref(), Ok("device-9"));
 }
 
@@ -457,7 +599,12 @@ async fn jwks_alg_must_match_the_keys_type() {
     let a = jwks_auth(&server, Duration::from_secs(60)).await;
     let c = claims("d", 300);
     // ES256 token pointing at the RSA key's kid.
-    let t = signed(Algorithm::ES256, Some("r1"), &EncodingKey::from_ec_der(&k.ec_pkcs8), &c);
+    let t = signed(
+        Algorithm::ES256,
+        Some("r1"),
+        &EncodingKey::from_ec_der(&k.ec_pkcs8),
+        &c,
+    );
     assert_eq!(check(&a, &t).await, Err(AuthError::BadAlgorithm));
     // RS512 / PS256 with the right key: outside the fixed set.
     for alg in [Algorithm::RS512, Algorithm::PS256] {
@@ -487,14 +634,27 @@ async fn jwks_symmetric_and_mislabelled_keys_are_ignored() {
     .await;
     let a = jwks_auth(&server, Duration::from_secs(60)).await;
     let c = claims("d", 300);
-    let hs = signed(Algorithm::HS256, Some("o1"), &EncodingKey::from_secret(SECRET), &c);
+    let hs = signed(
+        Algorithm::HS256,
+        Some("o1"),
+        &EncodingKey::from_secret(SECRET),
+        &c,
+    );
     assert_eq!(check(&a, &hs).await, Err(AuthError::BadAlgorithm));
     let enc = signed(Algorithm::RS256, Some("r-enc"), &k.rsa_encoding(), &c);
     assert_eq!(check(&a, &enc).await, Err(AuthError::UnknownKey));
     let r512 = signed(Algorithm::RS256, Some("r-512"), &k.rsa_encoding(), &c);
     assert_eq!(check(&a, &r512).await, Err(AuthError::UnknownKey));
-    let es = signed(Algorithm::ES256, Some("e1"), &EncodingKey::from_ec_der(&k.ec_pkcs8), &c);
-    assert!(check(&a, &es).await.is_ok(), "the usable key in the same set still works");
+    let es = signed(
+        Algorithm::ES256,
+        Some("e1"),
+        &EncodingKey::from_ec_der(&k.ec_pkcs8),
+        &c,
+    );
+    assert!(
+        check(&a, &es).await.is_ok(),
+        "the usable key in the same set still works"
+    );
 }
 
 #[tokio::test]
@@ -512,7 +672,12 @@ async fn jwks_expired_token() {
     let server = JwksServer::start(json!({"keys": [k.ed_jwk("d1")]})).await;
     let a = jwks_auth(&server, Duration::from_secs(60)).await;
     let now = unix_now() as i64;
-    let t = signed(Algorithm::EdDSA, Some("d1"), &EncodingKey::from_ed_der(&k.ed_pkcs8), &json!({"sub": "d", "exp": now - 3600}));
+    let t = signed(
+        Algorithm::EdDSA,
+        Some("d1"),
+        &EncodingKey::from_ed_der(&k.ed_pkcs8),
+        &json!({"sub": "d", "exp": now - 3600}),
+    );
     assert_eq!(check(&a, &t).await, Err(AuthError::Expired));
 }
 
@@ -524,7 +689,12 @@ async fn jwks_unknown_kid_refreshes_rate_limited() {
     let a = jwks_auth(&server, Duration::from_millis(500)).await;
     assert_eq!(server.hits(), 1);
     let c = claims("d", 300);
-    let new_token = signed(Algorithm::ES256, Some("new"), &EncodingKey::from_ec_der(&k2.ec_pkcs8), &c);
+    let new_token = signed(
+        Algorithm::ES256,
+        Some("new"),
+        &EncodingKey::from_ec_der(&k2.ec_pkcs8),
+        &c,
+    );
 
     // Rotated at the provider; the relay has not seen it yet.
     server.set(json!({"keys": [k1.ec_jwk("old"), k2.ec_jwk("new")]}));
@@ -534,10 +704,19 @@ async fn jwks_unknown_kid_refreshes_rate_limited() {
 
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(check(&a, &new_token).await.as_deref(), Ok("d"));
-    assert_eq!(server.hits(), 2, "unknown kid triggered exactly one refetch");
+    assert_eq!(
+        server.hits(),
+        2,
+        "unknown kid triggered exactly one refetch"
+    );
 
     // A burst of unknown kids right after: at most one fetch per interval.
-    let bogus = signed(Algorithm::ES256, Some("bogus"), &EncodingKey::from_ec_der(&k2.ec_pkcs8), &c);
+    let bogus = signed(
+        Algorithm::ES256,
+        Some("bogus"),
+        &EncodingKey::from_ec_der(&k2.ec_pkcs8),
+        &c,
+    );
     for _ in 0..20 {
         assert_eq!(check(&a, &bogus).await, Err(AuthError::UnknownKey));
     }
@@ -551,12 +730,22 @@ async fn jwks_removed_key_stops_working_after_refresh() {
     let server = JwksServer::start(json!({"keys": [k1.ec_jwk("a")]})).await;
     let a = jwks_auth(&server, Duration::from_millis(100)).await;
     let c = claims("d", 300);
-    let old = signed(Algorithm::ES256, Some("a"), &EncodingKey::from_ec_der(&k1.ec_pkcs8), &c);
+    let old = signed(
+        Algorithm::ES256,
+        Some("a"),
+        &EncodingKey::from_ec_der(&k1.ec_pkcs8),
+        &c,
+    );
     assert!(check(&a, &old).await.is_ok());
     server.set(json!({"keys": [k2.ec_jwk("b")]}));
     tokio::time::sleep(Duration::from_millis(150)).await;
     // A token for the new key triggers the refresh that drops the old one.
-    let new = signed(Algorithm::ES256, Some("b"), &EncodingKey::from_ec_der(&k2.ec_pkcs8), &c);
+    let new = signed(
+        Algorithm::ES256,
+        Some("b"),
+        &EncodingKey::from_ec_der(&k2.ec_pkcs8),
+        &c,
+    );
     assert!(check(&a, &new).await.is_ok());
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(check(&a, &old).await, Err(AuthError::UnknownKey));
@@ -577,6 +766,11 @@ async fn jwks_unreachable_is_not_ready() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!a.is_ready());
     let k = Keys::generate();
-    let t = signed(Algorithm::ES256, Some("e"), &EncodingKey::from_ec_der(&k.ec_pkcs8), &claims("d", 60));
+    let t = signed(
+        Algorithm::ES256,
+        Some("e"),
+        &EncodingKey::from_ec_der(&k.ec_pkcs8),
+        &claims("d", 60),
+    );
     assert_eq!(check(&a, &t).await, Err(AuthError::KeysUnavailable));
 }

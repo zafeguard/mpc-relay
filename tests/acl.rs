@@ -20,7 +20,12 @@ fn me() -> Principal {
 fn me_limited(sessions: &[&str]) -> Principal {
     Principal {
         sub: ME.into(),
-        sessions: Some(sessions.iter().map(|s| s.to_string()).collect::<HashSet<_>>()),
+        sessions: Some(
+            sessions
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<HashSet<_>>(),
+        ),
     }
 }
 
@@ -36,7 +41,13 @@ fn q(sub: &str, s: &str) -> String {
 
 #[test]
 fn subscribe_broadcast() {
-    let g = authorize_subscribe(&me(), EX, &dest(&format!("session.{S}.broadcast")), Some(&q(ME, S))).unwrap();
+    let g = authorize_subscribe(
+        &me(),
+        EX,
+        &dest(&format!("session.{S}.broadcast")),
+        Some(&q(ME, S)),
+    )
+    .unwrap();
     assert_eq!(g.routing_key, format!("session.{S}.broadcast"));
     assert_eq!(g.queue, format!("mpc.session.{ME}.{S}"));
     assert_eq!(g.session, S);
@@ -44,7 +55,13 @@ fn subscribe_broadcast() {
 
 #[test]
 fn subscribe_own_unicast() {
-    let g = authorize_subscribe(&me(), EX, &dest(&format!("session.{S}.node.{ME}")), Some(&q(ME, S))).unwrap();
+    let g = authorize_subscribe(
+        &me(),
+        EX,
+        &dest(&format!("session.{S}.node.{ME}")),
+        Some(&q(ME, S)),
+    )
+    .unwrap();
     assert_eq!(g.routing_key, format!("session.{S}.node.{ME}"));
     assert_eq!(g.queue, format!("mpc.session.{ME}.{S}"));
 }
@@ -52,8 +69,20 @@ fn subscribe_own_unicast() {
 #[test]
 fn subscribe_within_sessions_claim() {
     let p = me_limited(&[S, S2]);
-    assert!(authorize_subscribe(&p, EX, &dest(&format!("session.{S}.broadcast")), Some(&q(ME, S))).is_ok());
-    assert!(authorize_subscribe(&p, EX, &dest(&format!("session.{S2}.node.{ME}")), Some(&q(ME, S2))).is_ok());
+    assert!(authorize_subscribe(
+        &p,
+        EX,
+        &dest(&format!("session.{S}.broadcast")),
+        Some(&q(ME, S))
+    )
+    .is_ok());
+    assert!(authorize_subscribe(
+        &p,
+        EX,
+        &dest(&format!("session.{S2}.node.{ME}")),
+        Some(&q(ME, S2))
+    )
+    .is_ok());
 }
 
 // ---- SUBSCRIBE: rejected ------------------------------------------------
@@ -75,7 +104,11 @@ fn subscribe_rejects_other_destination_types() {
         format!("/exchange/{EX}"),
         format!("/exchange/{EX}/"),
     ] {
-        assert_eq!(sub_err(&me(), &d, Some(&queue)), AclError::UnsupportedDestination, "{d}");
+        assert_eq!(
+            sub_err(&me(), &d, Some(&queue)),
+            AclError::UnsupportedDestination,
+            "{d}"
+        );
     }
 }
 
@@ -83,7 +116,11 @@ fn subscribe_rejects_other_destination_types() {
 fn subscribe_rejects_other_exchange() {
     for ex in ["amq.topic", "other", "mpc.cohort2", ""] {
         let d = format!("/exchange/{ex}/session.{S}.broadcast");
-        assert_eq!(sub_err(&me(), &d, Some(&q(ME, S))), AclError::ForeignExchange, "{d}");
+        assert_eq!(
+            sub_err(&me(), &d, Some(&q(ME, S))),
+            AclError::ForeignExchange,
+            "{d}"
+        );
     }
 }
 
@@ -97,7 +134,11 @@ fn subscribe_rejects_wildcards() {
         format!("session.{S}.node.*"),
         format!("session.{S}.node.dev#"),
     ] {
-        assert_eq!(sub_err(&me(), &dest(&key), Some(&q(ME, S))), AclError::Wildcard, "{key}");
+        assert_eq!(
+            sub_err(&me(), &dest(&key), Some(&q(ME, S))),
+            AclError::Wildcard,
+            "{key}"
+        );
     }
 }
 
@@ -132,7 +173,11 @@ fn subscribe_rejects_non_canonical_session_ids() {
         "0b9f4c1e_6d2a_4f6b_9e0c_3a5d7b8c9d0e",
     ] {
         let key = format!("session.{s}.broadcast");
-        assert_eq!(sub_err(&me(), &dest(&key), Some(&q(ME, s))), AclError::BadSession, "{s}");
+        assert_eq!(
+            sub_err(&me(), &dest(&key), Some(&q(ME, s))),
+            AclError::BadSession,
+            "{s}"
+        );
     }
 }
 
@@ -140,7 +185,11 @@ fn subscribe_rejects_non_canonical_session_ids() {
 fn subscribe_rejects_other_nodes_unicast() {
     for other in ["device-2", "agent-0", "device-10", "Device-1"] {
         let key = format!("session.{S}.node.{other}");
-        assert_eq!(sub_err(&me(), &dest(&key), Some(&q(ME, S))), AclError::NotOwnNode, "{other}");
+        assert_eq!(
+            sub_err(&me(), &dest(&key), Some(&q(ME, S))),
+            AclError::NotOwnNode,
+            "{other}"
+        );
     }
 }
 
@@ -156,20 +205,33 @@ fn subscribe_requires_matching_queue_name() {
         "".to_string(),
         format!("amq.gen-{S}"),
     ] {
-        assert_eq!(sub_err(&me(), &d, Some(&bad)), AclError::QueueNameMismatch, "{bad}");
+        assert_eq!(
+            sub_err(&me(), &d, Some(&bad)),
+            AclError::QueueNameMismatch,
+            "{bad}"
+        );
     }
     // The node key must use the queue for ITS session too.
     let d = dest(&format!("session.{S}.node.{ME}"));
-    assert_eq!(sub_err(&me(), &d, Some(&q(ME, S2))), AclError::QueueNameMismatch);
+    assert_eq!(
+        sub_err(&me(), &d, Some(&q(ME, S2))),
+        AclError::QueueNameMismatch
+    );
 }
 
 #[test]
 fn subscribe_outside_sessions_claim() {
     let p = me_limited(&[S2]);
     let d = dest(&format!("session.{S}.broadcast"));
-    assert_eq!(sub_err(&p, &d, Some(&q(ME, S))), AclError::SessionNotAllowed);
+    assert_eq!(
+        sub_err(&p, &d, Some(&q(ME, S))),
+        AclError::SessionNotAllowed
+    );
     let empty = me_limited(&[]);
-    assert_eq!(sub_err(&empty, &d, Some(&q(ME, S))), AclError::SessionNotAllowed);
+    assert_eq!(
+        sub_err(&empty, &d, Some(&q(ME, S))),
+        AclError::SessionNotAllowed
+    );
 }
 
 #[test]
@@ -184,10 +246,16 @@ fn subscribe_rejects_invalid_node_ids_in_key() {
 #[test]
 fn queue_name_length_is_bounded() {
     // mpc.session. (12) + sub + . (1) + uuid (36) <= 255  =>  sub <= 206
-    let ok = Principal { sub: "a".repeat(206), sessions: None };
+    let ok = Principal {
+        sub: "a".repeat(206),
+        sessions: None,
+    };
     let d = dest(&format!("session.{S}.broadcast"));
     assert!(authorize_subscribe(&ok, EX, &d, Some(&q(&ok.sub, S))).is_ok());
-    let long = Principal { sub: "a".repeat(207), sessions: None };
+    let long = Principal {
+        sub: "a".repeat(207),
+        sessions: None,
+    };
     assert_eq!(
         authorize_subscribe(&long, EX, &d, Some(&q(&long.sub, S))),
         Err(AclError::TooLong)
@@ -214,18 +282,42 @@ fn send_allowed() {
 #[test]
 fn send_rejected() {
     let cases: Vec<(String, AclError)> = vec![
-        (format!("/queue/session.{S}.broadcast"), AclError::UnsupportedDestination),
-        (format!("/topic/session.{S}.broadcast"), AclError::UnsupportedDestination),
-        (format!("/amq/queue/x"), AclError::UnsupportedDestination),
-        (format!("/temp-queue/x"), AclError::UnsupportedDestination),
-        (format!("/exchange/other/session.{S}.broadcast"), AclError::ForeignExchange),
+        (
+            format!("/queue/session.{S}.broadcast"),
+            AclError::UnsupportedDestination,
+        ),
+        (
+            format!("/topic/session.{S}.broadcast"),
+            AclError::UnsupportedDestination,
+        ),
+        ("/amq/queue/x".to_string(), AclError::UnsupportedDestination),
+        (
+            "/temp-queue/x".to_string(),
+            AclError::UnsupportedDestination,
+        ),
+        (
+            format!("/exchange/other/session.{S}.broadcast"),
+            AclError::ForeignExchange,
+        ),
         (dest(&format!("session.{S}.*")), AclError::Wildcard),
         (dest(&format!("session.{S}.node.#")), AclError::Wildcard),
         (dest("anything.else"), AclError::BadRoutingKey),
-        (dest(&format!("session.{S}.node.")), AclError::BadNodeId("empty")),
-        (dest(&format!("session.{S}.node.a b")), AclError::BadNodeId("contains whitespace")),
-        (dest(&format!("session.{S}.node.a/b")), AclError::BadNodeId("contains '/'")),
-        (dest("session.NOT-A-UUID-AT-ALL-000000000000000000.broadcast"), AclError::BadSession),
+        (
+            dest(&format!("session.{S}.node.")),
+            AclError::BadNodeId("empty"),
+        ),
+        (
+            dest(&format!("session.{S}.node.a b")),
+            AclError::BadNodeId("contains whitespace"),
+        ),
+        (
+            dest(&format!("session.{S}.node.a/b")),
+            AclError::BadNodeId("contains '/'"),
+        ),
+        (
+            dest("session.NOT-A-UUID-AT-ALL-000000000000000000.broadcast"),
+            AclError::BadSession,
+        ),
     ];
     for (d, want) in cases {
         assert_eq!(authorize_send(&me(), EX, &d), Err(want), "{d}");
@@ -255,7 +347,15 @@ fn routing_key_length_is_bounded() {
 
 #[test]
 fn node_ids() {
-    for ok in ["a", "device-1", "agent.0", "x".repeat(255).as_str(), "\u{e9}", "a:b", "a@b"] {
+    for ok in [
+        "a",
+        "device-1",
+        "agent.0",
+        "x".repeat(255).as_str(),
+        "\u{e9}",
+        "a:b",
+        "a@b",
+    ] {
         assert!(validate_node_id(ok).is_ok(), "{ok:?}");
     }
     for bad in [
@@ -279,11 +379,15 @@ fn node_ids() {
 #[test]
 fn routing_key_parse_targets() {
     assert_eq!(
-        parse_routing_key(&format!("session.{S}.broadcast")).unwrap().target,
+        parse_routing_key(&format!("session.{S}.broadcast"))
+            .unwrap()
+            .target,
         Target::Broadcast
     );
     assert_eq!(
-        parse_routing_key(&format!("session.{S}.node.agent-1")).unwrap().target,
+        parse_routing_key(&format!("session.{S}.node.agent-1"))
+            .unwrap()
+            .target,
         Target::Node("agent-1".into())
     );
 }

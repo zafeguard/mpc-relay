@@ -140,14 +140,16 @@ fn peek_header(token: &str) -> Result<(Algorithm, Option<String>), AuthError> {
         return Err(AuthError::Malformed);
     }
     let mut parts = token.split('.');
-    let (Some(h), Some(_), Some(_), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    let (Some(h), Some(_), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return Err(AuthError::Malformed);
     };
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(h)
         .map_err(|_| AuthError::Malformed)?;
-    let header: Map<String, Value> = serde_json::from_slice(&raw).map_err(|_| AuthError::Malformed)?;
+    let header: Map<String, Value> =
+        serde_json::from_slice(&raw).map_err(|_| AuthError::Malformed)?;
     // RFC 7515 4.1.11: a recipient that does not understand a `crit`
     // extension must reject the token. This relay understands none.
     if header.contains_key("crit") {
@@ -226,7 +228,9 @@ fn parse_jwks(body: &[u8]) -> Result<Vec<VerifyKey>, String> {
         match serde_json::from_value::<Jwk>(k.clone()) {
             Ok(jwk) => match jwk_to_key(&jwk) {
                 Some(vk) => out.push(vk),
-                None => tracing::debug!(kid = ?jwk.common.key_id, "skipping JWKS key not usable for RS256/ES256/EdDSA verification"),
+                None => {
+                    tracing::debug!(kid = ?jwk.common.key_id, "skipping JWKS key not usable for RS256/ES256/EdDSA verification")
+                }
             },
             Err(e) => tracing::warn!(error = %e, "skipping unparseable JWKS key"),
         }
@@ -439,7 +443,9 @@ impl Authenticator {
         passcode: Option<&str>,
     ) -> Result<Identity, AuthError> {
         if let Mode::Disabled = self.mode {
-            let sub = login.filter(|l| !l.is_empty()).ok_or(AuthError::MissingClaim("login".into()))?;
+            let sub = login
+                .filter(|l| !l.is_empty())
+                .ok_or(AuthError::MissingClaim("login".into()))?;
             validate_node_id(sub).map_err(|_| AuthError::InvalidSub)?;
             return Ok(Identity {
                 principal: Principal {
@@ -501,7 +507,12 @@ impl Authenticator {
         self.check_claims(claims)
     }
 
-    fn verify(&self, token: &str, alg: Algorithm, key: &DecodingKey) -> Result<Map<String, Value>, AuthError> {
+    fn verify(
+        &self,
+        token: &str,
+        alg: Algorithm,
+        key: &DecodingKey,
+    ) -> Result<Map<String, Value>, AuthError> {
         let mut v = Validation::new(alg);
         v.algorithms = vec![alg];
         v.leeway = self.cfg.leeway.as_secs();
@@ -547,7 +558,9 @@ impl Authenticator {
             return Err(AuthError::Expired);
         }
         if let Some(nbf) = claims.get("nbf") {
-            let nbf = nbf.as_u64().ok_or_else(|| AuthError::InvalidClaim("nbf".into()))?;
+            let nbf = nbf
+                .as_u64()
+                .ok_or_else(|| AuthError::InvalidClaim("nbf".into()))?;
             if nbf > now.saturating_add(leeway) {
                 return Err(AuthError::NotYetValid);
             }
@@ -555,7 +568,9 @@ impl Authenticator {
         let iat = match claims.get("iat") {
             None => None,
             Some(v) => {
-                let iat = v.as_u64().ok_or_else(|| AuthError::InvalidClaim("iat".into()))?;
+                let iat = v
+                    .as_u64()
+                    .ok_or_else(|| AuthError::InvalidClaim("iat".into()))?;
                 if iat > now.saturating_add(leeway) {
                     return Err(AuthError::IssuedInFuture);
                 }
@@ -567,7 +582,8 @@ impl Authenticator {
             let iat = iat.ok_or_else(|| AuthError::MissingClaim("iat".into()))?;
             // exp - iat bounds the declared lifetime; exp - now bounds what
             // is left of it, which an iat in the near future could stretch.
-            if exp.saturating_sub(iat) > max || exp.saturating_sub(now) > max.saturating_add(leeway) {
+            if exp.saturating_sub(iat) > max || exp.saturating_sub(now) > max.saturating_add(leeway)
+            {
                 return Err(AuthError::TtlTooLong);
             }
         }

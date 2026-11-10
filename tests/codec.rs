@@ -109,7 +109,11 @@ fn content_length_zero() {
 fn content_length_waits_for_the_whole_body() {
     let mut d = Decoder::new(MAX);
     d.extend(b"SEND\ncontent-length:4\n\nab\0");
-    assert_eq!(d.decode().unwrap(), None, "a NUL inside a sized body is not the end");
+    assert_eq!(
+        d.decode().unwrap(),
+        None,
+        "a NUL inside a sized body is not the end"
+    );
     d.extend(b"c\0");
     let f = d.decode().unwrap().unwrap();
     assert_eq!(&f.body[..], b"ab\0c");
@@ -149,8 +153,14 @@ fn connect_headers_are_not_unescaped() {
 
 #[test]
 fn invalid_escape_is_an_error() {
-    assert_eq!(decode_all(b"SEND\nk:a\\tb\n\n\0", MAX), Err(CodecError::InvalidEscape));
-    assert_eq!(decode_all(b"SEND\nk:trailing\\\n\n\0", MAX), Err(CodecError::InvalidEscape));
+    assert_eq!(
+        decode_all(b"SEND\nk:a\\tb\n\n\0", MAX),
+        Err(CodecError::InvalidEscape)
+    );
+    assert_eq!(
+        decode_all(b"SEND\nk:trailing\\\n\n\0", MAX),
+        Err(CodecError::InvalidEscape)
+    );
     assert_eq!(unescape(b"ok\\c"), Ok("ok:".into()));
 }
 
@@ -188,8 +198,14 @@ fn raw_colon_in_value_is_kept() {
 
 #[test]
 fn malformed_frames() {
-    assert_eq!(decode_all(b"send\n\n\0", MAX), Err(CodecError::Malformed("invalid command")));
-    assert_eq!(decode_all(b"SE ND\n\n\0", MAX), Err(CodecError::Malformed("invalid command")));
+    assert_eq!(
+        decode_all(b"send\n\n\0", MAX),
+        Err(CodecError::Malformed("invalid command"))
+    );
+    assert_eq!(
+        decode_all(b"SE ND\n\n\0", MAX),
+        Err(CodecError::Malformed("invalid command"))
+    );
     assert_eq!(
         decode_all(b"SEND\nnocolon\n\n\0", MAX),
         Err(CodecError::Malformed("header line without ':'"))
@@ -198,7 +214,10 @@ fn malformed_frames() {
         decode_all(b"SEND\n:value\n\n\0", MAX),
         Err(CodecError::Malformed("empty header name"))
     );
-    assert_eq!(decode_all(b"SEND\nk:\xff\n\n\0", MAX), Err(CodecError::InvalidUtf8));
+    assert_eq!(
+        decode_all(b"SEND\nk:\xff\n\n\0", MAX),
+        Err(CodecError::InvalidUtf8)
+    );
 }
 
 #[test]
@@ -247,7 +266,10 @@ fn frame_exactly_at_the_limit_is_accepted() {
     assert_eq!(wire.len(), 1024);
     assert_eq!(decode_all(&wire, 1024).unwrap()[0].body.len(), body_len);
     wire.insert(head.len(), b'a');
-    assert_eq!(decode_all(&wire, 1024), Err(CodecError::FrameTooLarge { limit: 1024 }));
+    assert_eq!(
+        decode_all(&wire, 1024),
+        Err(CodecError::FrameTooLarge { limit: 1024 })
+    );
 }
 
 #[test]

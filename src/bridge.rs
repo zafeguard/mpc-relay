@@ -53,6 +53,8 @@ const OUTBOUND_QUEUE: usize = 64;
 const OP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on each broker operation during cleanup.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for the client's Close after sending ours.
+const CLOSE_LINGER: Duration = Duration::from_secs(3);
 
 pub const SERVER_NAME: &str = concat!("mpc-relay/", env!("CARGO_PKG_VERSION"));
 
@@ -250,7 +252,12 @@ fn broker_failure(err: BrokerOpError, receipt: &Option<String>) -> Option<End> {
                 e.get_message().to_string(),
                 receipt,
             ),
-            _ => fail("broker_error", "broker error", e.get_message().to_string(), receipt),
+            _ => fail(
+                "broker_error",
+                "broker error",
+                e.get_message().to_string(),
+                receipt,
+            ),
         },
         BrokerOpError::Amqp(lapin::Error::ChannelsLimitReached) => fail(
             "channel_limit",
@@ -285,8 +292,14 @@ async fn op<T>(
 // ---------------------------------------------------------------------------
 
 enum Outbound {
-    Frame { bytes: Vec<u8>, command: &'static str },
-    Delivery { bytes: Vec<u8>, acker: Acker },
+    Frame {
+        bytes: Vec<u8>,
+        command: &'static str,
+    },
+    Delivery {
+        bytes: Vec<u8>,
+        acker: Acker,
+    },
     Close,
 }
 
@@ -346,8 +359,15 @@ async fn write_loop(
     }
 }
 
-async fn send(sink: &mut SplitSink<WebSocket, Message>, msg: Message, write_timeout: Duration) -> bool {
-    matches!(tokio::time::timeout(write_timeout, sink.send(msg)).await, Ok(Ok(())))
+async fn send(
+    sink: &mut SplitSink<WebSocket, Message>,
+    msg: Message,
+    write_timeout: Duration,
+) -> bool {
+    matches!(
+        tokio::time::timeout(write_timeout, sink.send(msg)).await,
+        Ok(Ok(()))
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +505,10 @@ impl Dispatcher {
                 let _ = reply.send(r);
             }
             DispatchCmd::Cancel { sub_id, reply } => {
-                let Some(slot) = self.slots.iter_mut().find(|s| s.sub_id == sub_id && !s.cancelling)
+                let Some(slot) = self
+                    .slots
+                    .iter_mut()
+                    .find(|s| s.sub_id == sub_id && !s.cancelling)
                 else {
                     let _ = reply.send(Ok(()));
                     return;
@@ -495,7 +518,10 @@ impl Dispatcher {
                 // Returns once basic.cancel-ok has arrived: the broker will
                 // deliver nothing more to this consumer. What it delivered
                 // before that is still in the stream and is forwarded.
-                let r = op(self.channel.basic_cancel(&tag, BasicCancelOptions::default())).await;
+                let r = op(self
+                    .channel
+                    .basic_cancel(&tag, BasicCancelOptions::default()))
+                .await;
                 let _ = reply.send(r);
             }
         }
@@ -536,7 +562,11 @@ fn message_frame(sub_id: &str, conn_id: u64, d: &Delivery) -> Vec<u8> {
         .with_header("subscription", sub_id)
         .with_header(
             "destination",
-            format!("/exchange/{}/{}", d.exchange.as_str(), d.routing_key.as_str()),
+            format!(
+                "/exchange/{}/{}",
+                d.exchange.as_str(),
+                d.routing_key.as_str()
+            ),
         )
         .with_header(
             "message-id",
@@ -638,9 +668,23 @@ pub async fn serve(ws: WebSocket, shared: Arc<Shared>, slot: ConnectionSlot, pee
         connected: None,
         new_events: None,
     };
-    let end = session.read_loop(stream).await;
+    let mut stream = stream;
+    let end = session.read_loop(&mut stream).await;
     session.finish(end).await;
     drop(session);
+    // Lingering close. The writer has queued ERROR (if any) and a Close
+    // frame; keep reading until the client answers with its own Close. If
+    // the socket were dropped now, a client still sending (a pong, a frame
+    // in flight) would get a TCP reset, and a reset lets the client's stack
+    // discard the ERROR frame it has not read yet.
+    let _ = tokio::time::timeout(CLOSE_LINGER, async {
+        while let Some(Ok(msg)) = stream.next().await {
+            if let Message::Close(_) = msg {
+                break;
+            }
+        }
+    })
+    .await;
     let _ = tokio::time::timeout(limits.write_timeout + Duration::from_secs(1), writer).await;
     drop(slot);
 }
@@ -684,7 +728,7 @@ async fn recv_opt(rx: &mut Option<mpsc::Receiver<DispatchEvent>>) -> Option<Disp
 }
 
 impl Session {
-    async fn read_loop(&mut self, mut stream: SplitStream<WebSocket>) -> End {
+    async fn read_loop(&mut self, stream: &mut SplitStream<WebSocket>) -> End {
         let limits = self.shared.config.limits.clone();
         let shutdown = self.shared.shutdown.clone();
         let out = self.out.clone();
@@ -822,7 +866,8 @@ impl Session {
 
     async fn receipt(&self, receipt: Option<String>) {
         if let Some(r) = receipt {
-            self.emit(Frame::new("RECEIPT").with_header("receipt-id", r)).await;
+            self.emit(Frame::new("RECEIPT").with_header("receipt-id", r))
+                .await;
         }
     }
 
@@ -878,7 +923,12 @@ impl Session {
             Err(e) => {
                 self.shared.metrics.auth_failure(e.reason());
                 tracing::info!(conn = self.conn_id, peer = %self.peer, reason = e.reason(), detail = %e, "authentication failed");
-                return fail("auth", "authentication failed", "authentication failed", &none);
+                return fail(
+                    "auth",
+                    "authentication failed",
+                    "authentication failed",
+                    &none,
+                );
             }
         };
         if self.shared.auth.is_disabled() {
@@ -899,6 +949,16 @@ impl Session {
         };
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (ev_tx, ev_rx) = mpsc::channel(4);
+        {
+            // The broker closes a channel asynchronously, e.g. after a
+            // publish to an exchange that has since been deleted. Without
+            // this a client with no consumers would only find out on its
+            // next frame.
+            let ev_tx = ev_tx.clone();
+            channel.on_error(move |e| {
+                let _ = ev_tx.try_send(DispatchEvent::ChannelFailed(e.to_string()));
+            });
+        }
         let dispatcher = Dispatcher {
             channel: channel.clone(),
             out: self.out.clone(),
@@ -937,13 +997,28 @@ impl Session {
         let exchange = &self.shared.config.exchange;
         let c = self.connected.as_mut().expect("connected");
         let Some(id) = frame.header("id").filter(|v| !v.is_empty()) else {
-            return fail("protocol", "missing header", "SUBSCRIBE requires an id header", &receipt);
+            return fail(
+                "protocol",
+                "missing header",
+                "SUBSCRIBE requires an id header",
+                &receipt,
+            );
         };
         if id.len() > 255 {
-            return fail("protocol", "invalid header", "subscription id longer than 255 bytes", &receipt);
+            return fail(
+                "protocol",
+                "invalid header",
+                "subscription id longer than 255 bytes",
+                &receipt,
+            );
         }
         let Some(destination) = frame.header("destination") else {
-            return fail("protocol", "missing header", "SUBSCRIBE requires a destination header", &receipt);
+            return fail(
+                "protocol",
+                "missing header",
+                "SUBSCRIBE requires a destination header",
+                &receipt,
+            );
         };
         match frame.header("ack") {
             None | Some("auto") => {}
@@ -957,13 +1032,21 @@ impl Session {
             }
         }
         if c.subs.contains_key(id) {
-            return fail("protocol", "duplicate subscription id", format!("subscription {id} already exists"), &receipt);
+            return fail(
+                "protocol",
+                "duplicate subscription id",
+                format!("subscription {id} already exists"),
+                &receipt,
+            );
         }
         if c.subs.len() >= limits.max_subscriptions {
             return fail(
                 "too_many_subscriptions",
                 "too many subscriptions",
-                format!("at most {} subscriptions per connection", limits.max_subscriptions),
+                format!(
+                    "at most {} subscriptions per connection",
+                    limits.max_subscriptions
+                ),
                 &receipt,
             );
         }
@@ -1060,10 +1143,20 @@ impl Session {
     async fn on_unsubscribe(&mut self, frame: Frame, receipt: Option<String>) -> Option<End> {
         let c = self.connected.as_mut().expect("connected");
         let Some(id) = frame.header("id").filter(|v| !v.is_empty()) else {
-            return fail("protocol", "missing header", "UNSUBSCRIBE requires an id header", &receipt);
+            return fail(
+                "protocol",
+                "missing header",
+                "UNSUBSCRIBE requires an id header",
+                &receipt,
+            );
         };
         if !c.subs.contains_key(id) {
-            return fail("protocol", "subscription not found", format!("no subscription {id}"), &receipt);
+            return fail(
+                "protocol",
+                "subscription not found",
+                format!("no subscription {id}"),
+                &receipt,
+            );
         }
         if !self.bucket.take() {
             return rate_limited(&receipt);
@@ -1101,7 +1194,12 @@ impl Session {
         let exchange = &self.shared.config.exchange;
         let c = self.connected.as_mut().expect("connected");
         let Some(destination) = frame.header("destination") else {
-            return fail("protocol", "missing header", "SEND requires a destination header", &receipt);
+            return fail(
+                "protocol",
+                "missing header",
+                "SEND requires a destination header",
+                &receipt,
+            );
         };
         if !self.bucket.take() {
             return rate_limited(&receipt);
@@ -1135,7 +1233,12 @@ impl Session {
             // the broker's publisher confirm.
             match tokio::time::timeout(OP_TIMEOUT, confirm).await {
                 Ok(Ok(Confirmation::Nack(_))) => {
-                    return fail("broker_error", "publish rejected", "the broker refused the message", &receipt)
+                    return fail(
+                        "broker_error",
+                        "publish rejected",
+                        "the broker refused the message",
+                        &receipt,
+                    )
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => return broker_failure(BrokerOpError::Amqp(e), &receipt),
@@ -1146,7 +1249,9 @@ impl Session {
             let metrics = self.shared.metrics.clone();
             let conn = self.conn_id;
             tokio::spawn(async move {
-                if let Ok(Ok(Confirmation::Nack(_))) = tokio::time::timeout(OP_TIMEOUT, confirm).await {
+                if let Ok(Ok(Confirmation::Nack(_))) =
+                    tokio::time::timeout(OP_TIMEOUT, confirm).await
+                {
                     metrics.error("publish_nack");
                     tracing::warn!(conn, "broker nacked a publish sent without receipt");
                 }
@@ -1234,7 +1339,8 @@ async fn cleanup(shared: &Shared, conn_id: u64, c: Connected) {
             for sub in c.subs.values() {
                 let _ = tokio::time::timeout(
                     CLEANUP_TIMEOUT,
-                    c.channel.basic_cancel(&sub.tag, BasicCancelOptions::default()),
+                    c.channel
+                        .basic_cancel(&sub.tag, BasicCancelOptions::default()),
                 )
                 .await;
             }
@@ -1259,20 +1365,27 @@ async fn cleanup(shared: &Shared, conn_id: u64, c: Connected) {
                     .await
                     {
                         Ok(Ok(_)) => tracing::debug!(conn = conn_id, queue = %q, "queue deleted"),
-                        Ok(Err(e)) => tracing::warn!(conn = conn_id, queue = %q, error = %e, "queue delete failed"),
-                        Err(_) => tracing::warn!(conn = conn_id, queue = %q, "queue delete timed out"),
+                        Ok(Err(e)) => {
+                            tracing::warn!(conn = conn_id, queue = %q, error = %e, "queue delete failed")
+                        }
+                        Err(_) => {
+                            tracing::warn!(conn = conn_id, queue = %q, "queue delete timed out")
+                        }
                     }
                     if !ch.status().connected() {
                         break;
                     }
                 }
                 if ch.id() != c.channel.id() {
-                    let _ = tokio::time::timeout(CLEANUP_TIMEOUT, ch.close(200, "cleanup done")).await;
+                    let _ =
+                        tokio::time::timeout(CLEANUP_TIMEOUT, ch.close(200, "cleanup done")).await;
                 }
             }
         }
         if c.channel.status().connected() {
-            let _ = tokio::time::timeout(CLEANUP_TIMEOUT, c.channel.close(200, "client disconnected")).await;
+            let _ =
+                tokio::time::timeout(CLEANUP_TIMEOUT, c.channel.close(200, "client disconnected"))
+                    .await;
         }
     }
     // With the connection gone, the broker already dropped its exclusive

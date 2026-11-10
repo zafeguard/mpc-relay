@@ -65,7 +65,10 @@ impl Metrics {
         )
         .expect("metric");
         let frames = IntCounterVec::new(
-            Opts::new("mpc_relay_frames_total", "STOMP frames by direction and command"),
+            Opts::new(
+                "mpc_relay_frames_total",
+                "STOMP frames by direction and command",
+            ),
             &["direction", "command"],
         )
         .expect("metric");
