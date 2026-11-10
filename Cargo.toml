@@ -2,7 +2,7 @@
 name = "mpc-relay"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT"
 description = "Authenticated, topology-aware STOMP-over-WebSocket to AMQP 0-9-1 bridge for MPC devices"
 repository = "https://github.com/zafeguard/mpc-relay"
