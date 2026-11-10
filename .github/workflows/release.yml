@@ -1,63 +1,219 @@
 name: release
 
+# Publishing a GitHub release is the only thing that ships an image.
+#
+#   1. Create a release whose tag is the version - `v0.1.0`, `v1.2.3` - and
+#      whose title is that tag and nothing else. Tick "Set as a pre-release"
+#      for anything that should not become `:latest`.
+#   2. This workflow resolves the version from the tag, runs the same gate as a
+#      pull request against the tagged tree, stamps the version into the crate
+#      (so `mpc-relay --version` and the `server` STOMP header report it), and
+#      pushes ghcr.io/zafeguard/mpc-relay:<tag>, :<version>, and :latest for a
+#      non-pre-release - one multi-arch index built on native amd64 and arm64
+#      runners.
+#
+# Nobody bumps Cargo.toml by hand between releases: the tag is the version.
+
 on:
-  push:
-    tags: ["v*"]
+  release:
+    types: [published]
+
+  # Re-run for an existing tag, e.g. when a release event was missed. Treated
+  # as a pre-release, so it never moves `:latest` by accident.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag (e.g. v1.2.3)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-jobs:
-  test:
-    uses: ./.github/workflows/ci.yml
+env:
+  REGISTRY: ghcr.io
+  IMAGE: zafeguard/mpc-relay
 
-  image:
-    name: multi-arch image to ghcr.io
-    needs: test
+jobs:
+  meta:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Resolve tag, version, prerelease
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$EVENT" = "release" ]; then
+            TAG="$RELEASE_TAG"; PRE="$RELEASE_PRE"
+          else
+            TAG="$INPUT_TAG"; PRE="true"
+          fi
+          # vMAJOR.MINOR.PATCH, optionally -prerelease. Anything else is a
+          # typo, and an image tagged with a typo cannot be un-published.
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::release tag '$TAG' is not vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "prerelease=$PRE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$TAG version=$VERSION prerelease=$PRE"
+
+  # The pull-request gate, against the tagged tree. Fails here: nothing ships.
+  test:
+    needs: meta
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.meta.outputs.tag }}
+
+  image-build:
+    name: image · ${{ matrix.platform }}
+    needs: [meta, test]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          # Native, not QEMU: an emulated Rust release build is many times
+          # slower, and this is the same pairing mpc-lib's agent image uses.
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    outputs:
+      digest-amd64: ${{ steps.export.outputs.digest-amd64 }}
+      digest-arm64: ${{ steps.export.outputs.digest-arm64 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      # The crate's version becomes the release version, in Cargo.toml and in
+      # this package's own Cargo.lock entry - the image builds with --locked,
+      # which refuses a lockfile that disagrees with the manifest.
+      - name: Stamp release version
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          v = os.environ["VERSION"]
+          toml = open("Cargo.toml").read()
+          toml, n = re.subn(r'(?m)^version = "[^"]*"$', f'version = "{v}"', toml, count=1)
+          assert n == 1, "no [package] version line in Cargo.toml"
+          open("Cargo.toml", "w").write(toml)
+          lock = open("Cargo.lock").read()
+          lock, n = re.subn(r'(name = "mpc-relay"\nversion = )"[^"]*"', rf'\1"{v}"', lock, count=1)
+          assert n == 1, "no mpc-relay entry in Cargo.lock"
+          open("Cargo.lock", "w").write(lock)
+          PY
+          grep -m1 '^version' Cargo.toml
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=relay-${{ matrix.arch }}
+          cache-to: type=gha,scope=relay-${{ matrix.arch }},mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Expose digest
+        id: export
+        run: echo "digest-${{ matrix.arch }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  image-merge:
+    name: image · multi-arch
+    needs: [meta, image-build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Tag must match Cargo.toml
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
-          if [ "$tag" != "$crate" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate}"
-            exit 1
-          fi
-
-      - name: Image tags
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/zafeguard/mpc-relay
-          flavor: |
-            latest=false
-          tags: |
-            type=raw,value=${{ github.ref_name }}
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
-
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - name: Image tags
+        id: tags
+        uses: docker/metadata-action@v5
         with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          provenance: true
-          sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ needs.meta.outputs.tag }}
+            type=raw,value=${{ needs.meta.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.meta.outputs.prerelease == 'false' }}
+
+      - name: Create the multi-arch index
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          DIGEST_AMD64: ${{ needs.image-build.outputs.digest-amd64 }}
+          DIGEST_ARM64: ${{ needs.image-build.outputs.digest-arm64 }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Assembling $tag"
+            docker buildx imagetools create \
+              --annotation "index:org.opencontainers.image.title=mpc-relay" \
+              --annotation "index:org.opencontainers.image.version=$VERSION" \
+              --annotation "index:org.opencontainers.image.source=https://github.com/$REPO" \
+              --annotation "index:org.opencontainers.image.documentation=https://github.com/$REPO#readme" \
+              --annotation "index:org.opencontainers.image.licenses=MIT" \
+              --annotation "index:org.opencontainers.image.description=STOMP-over-WebSocket to AMQP bridge for MPC devices in browsers and React Native" \
+              -t "$tag" \
+              "${IMAGE}@${DIGEST_AMD64}" \
+              "${IMAGE}@${DIGEST_ARM64}"
+          done <<< "$TAGS"
+          docker buildx imagetools inspect "${IMAGE}:${{ needs.meta.outputs.tag }}"
+
+  summary:
+    name: Release summary
+    runs-on: ubuntu-latest
+    needs: [meta, test, image-merge]
+    if: always()
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## Release · ${{ needs.meta.outputs.tag }}"
+            echo ""
+            echo "| Artefact | Identifier | Status |"
+            echo "|---|---|---|"
+            echo "| Test gate | \`ci.yml\` at \`${{ needs.meta.outputs.tag }}\` | ${{ needs.test.result }} |"
+            echo "| Docker (linux/amd64 + linux/arm64) | \`${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ needs.meta.outputs.tag }}\`, \`:${{ needs.meta.outputs.version }}\`$( [ '${{ needs.meta.outputs.prerelease }}' = 'false' ] && echo ', `:latest`' ) | ${{ needs.image-merge.result }} |"
+            echo ""
+            echo "Pre-release: \`${{ needs.meta.outputs.prerelease }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
