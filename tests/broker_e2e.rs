@@ -1016,3 +1016,40 @@ async fn a_channel_closed_by_the_broker_ends_the_session_promptly() {
     c.expect_error("broker unavailable").await;
     fx.teardown().await;
 }
+
+/// One AMQP connection carries every client's channel, so the broker's
+/// `channel_max` caps concurrent clients per relay regardless of
+/// MPC_RELAY_MAX_CONNECTIONS. Past it, CONNECT gets a clear ERROR.
+#[tokio::test]
+async fn channel_max_caps_clients_per_relay() {
+    let url = require_broker!();
+    let capped = format!("{url}?channel_max=3");
+    let fx = Fixture::with_config(url.clone(), |c| c.amqp_url = capped.clone()).await;
+    let mut held = Vec::new();
+    let mut refused = None;
+    for i in 0..6 {
+        match Stomp::connect(fx.addr, &token(&format!("d{i}"))).await {
+            Ok(c) => held.push(c),
+            Err(f) => {
+                refused = Some(f);
+                break;
+            }
+        }
+    }
+    let f = refused.expect("a client beyond channel_max is refused");
+    assert_eq!(f.header("message"), Some("too many connections"));
+    assert!(held.len() <= 3, "{} clients on channel_max=3", held.len());
+    // A freed channel is reusable.
+    drop(held.pop());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut ok = false;
+    for _ in 0..20 {
+        if Stomp::connect(fx.addr, &token("again")).await.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ok, "a channel freed by a departed client is reused");
+    fx.teardown().await;
+}

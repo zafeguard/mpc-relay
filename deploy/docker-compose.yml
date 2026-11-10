@@ -1,0 +1,63 @@
+# Local stack: RabbitMQ plus mpc-relay in front of it.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Devices connect to ws://localhost:8080/ws with a JWT signed by
+# MPC_RELAY_JWT_SECRET (see the README for minting one).
+#
+# The relay never declares the exchange: the MPC agents own it. With no
+# agents running here, the `exchange-init` service stands in for them and
+# declares it the way they do (durable topic). Until it exists the relay's
+# /readyz answers 503 and CONNECT is refused with "broker unavailable".
+
+name: mpc-relay
+
+services:
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: mpc
+      RABBITMQ_DEFAULT_PASS: mpc
+    ports:
+      - "5672:5672"     # AMQP, for the agents
+      - "15672:15672"   # management UI
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  exchange-init:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    command:
+      - -fsS
+      - -u
+      - mpc:mpc
+      - -X
+      - PUT
+      - -H
+      - "content-type: application/json"
+      - -d
+      - '{"type":"topic","durable":true}'
+      - http://rabbitmq:15672/api/exchanges/%2f/mpc.cohort
+    restart: "no"
+
+  relay:
+    build:
+      context: ..
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      MPC_RELAY_AMQP_URL: amqp://mpc:mpc@rabbitmq:5672/%2f
+      MPC_RELAY_EXCHANGE: mpc.cohort
+      # Development secret. Replace it, or switch to MPC_RELAY_JWKS_URL.
+      MPC_RELAY_JWT_SECRET: change-me-to-at-least-32-random-bytes
+      MPC_RELAY_LOG_FORMAT: text
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

@@ -1,0 +1,132 @@
+# mpc-relay on Kubernetes.
+#
+# Fill in the Secret (or replace it with your secret manager's equivalent)
+# and the image tag, then:
+#
+#   kubectl apply -f deploy/kubernetes.yaml
+#
+# The relay is stateless: run as many replicas as you like behind any load
+# balancer. A WebSocket stays on the replica that accepted it for its whole
+# life, so no session affinity is needed. Set the load balancer's idle
+# timeout above MPC_RELAY_PING_INTERVAL (default 20s): the relay pings every
+# client at that interval, and that traffic is what keeps an idle WebSocket
+# open through the balancer.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mpc-relay
+  labels:
+    app.kubernetes.io/name: mpc-relay
+type: Opaque
+stringData:
+  # amqps:// for a TLS broker (Amazon MQ). Credentials stay here, never in
+  # the devices.
+  MPC_RELAY_AMQP_URL: "amqps://USER:PASSWORD@b-xxxxxxxx.mq.REGION.amazonaws.com:5671/%2f"
+  # Either a shared secret (at least 32 bytes)...
+  MPC_RELAY_JWT_SECRET: "REPLACE-WITH-AT-LEAST-32-RANDOM-BYTES"
+  # ...or, instead, a JWKS URL (remove MPC_RELAY_JWT_SECRET if you use it):
+  # MPC_RELAY_JWKS_URL: "https://auth.example.com/.well-known/jwks.json"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mpc-relay
+  labels:
+    app.kubernetes.io/name: mpc-relay
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mpc-relay
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mpc-relay
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      # Longer than MPC_RELAY_SHUTDOWN_GRACE (20s) plus cleanup, so a
+      # rolling update drains clients instead of killing them.
+      terminationGracePeriodSeconds: 45
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          image: ghcr.io/zafeguard/mpc-relay:latest   # pin a version tag in production
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: mpc-relay
+          env:
+            - name: MPC_RELAY_EXCHANGE
+              value: mpc.cohort        # must equal the agents' rabbitmq.exchange
+            - name: MPC_RELAY_LISTEN
+              value: 0.0.0.0:8080
+            - name: MPC_RELAY_METRICS_LISTEN
+              value: 0.0.0.0:9090      # keeps /metrics off the public port
+            - name: MPC_RELAY_LOG_FORMAT
+              value: json
+            - name: MPC_RELAY_JWT_MAX_TTL
+              value: 15m
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: ws
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ws
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            # Ready = broker connected, exchange present, signing keys loaded,
+            # not draining. A replica that cannot reach the broker stops
+            # receiving new clients.
+            httpGet:
+              path: /readyz
+              port: ws
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mpc-relay
+  labels:
+    app.kubernetes.io/name: mpc-relay
+spec:
+  selector:
+    app.kubernetes.io/name: mpc-relay
+  ports:
+    - name: ws
+      port: 80
+      targetPort: ws
+    - name: metrics
+      port: 9090
+      targetPort: metrics

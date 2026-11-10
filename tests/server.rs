@@ -153,10 +153,15 @@ async fn oversize_and_malformed_frames() {
     s.send_text("SEND\ncontent-length:999999\n\n").await;
     s.expect_error("frame too large").await;
 
-    // Far beyond the WebSocket message limit: the WebSocket layer closes.
+    // Far beyond the WebSocket message limit, as one message: refused by
+    // the WebSocket layer before it is buffered, and still answered with
+    // a STOMP ERROR.
     let mut s = Stomp::open(r.local_addr, None).await;
-    s.send_raw(vec![b'A'; 512 * 1024]).await;
-    let _ = s.recv_within(TIMEOUT).await;
+    let mut huge = b"SEND\ndestination:/x\n\n".to_vec();
+    huge.extend(vec![b'A'; 512 * 1024]);
+    huge.push(0);
+    s.send_raw(huge).await;
+    s.expect_error("frame too large").await;
 
     let mut s = Stomp::open(r.local_addr, None).await;
     s.send_text("connect\n\n\0").await;
@@ -231,8 +236,13 @@ fn subprotocol_is_the_first_the_client_offers() {
 #[tokio::test]
 async fn subprotocol_negotiation_over_the_wire() {
     let r = relay(|_| {}).await;
+    // Both orders: the client's preference wins, not a sorted order.
+    let s = Stomp::open(r.local_addr, Some("v12.stomp, v11.stomp")).await;
+    assert_eq!(s.protocol.as_deref(), Some("v12.stomp"));
     let s = Stomp::open(r.local_addr, Some("v11.stomp, v12.stomp")).await;
     assert_eq!(s.protocol.as_deref(), Some("v11.stomp"));
+    let s = Stomp::open(r.local_addr, Some("stomp, v12.stomp")).await;
+    assert_eq!(s.protocol.as_deref(), Some("stomp"));
     let s = Stomp::open(r.local_addr, Some("stomp")).await;
     assert_eq!(s.protocol.as_deref(), Some("stomp"));
     // No subprotocol offered: accepted, none selected.

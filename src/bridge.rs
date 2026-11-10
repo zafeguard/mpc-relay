@@ -805,7 +805,24 @@ impl Session {
                 }
                 msg = stream.next() => {
                     let data: Bytes = match msg {
-                        None | Some(Err(_)) => return End::Silent("client went away"),
+                        None => return End::Silent("client went away"),
+                        Some(Err(e)) => {
+                            // A WebSocket message beyond the WebSocket limit is
+                            // refused before it is buffered; it is still an
+                            // oversize frame, so say so in STOMP terms.
+                            let inner = e.into_inner();
+                            if let Some(tungstenite::Error::Capacity(c)) =
+                                inner.downcast_ref::<tungstenite::Error>()
+                            {
+                                return End::Error(StompError {
+                                    reason: "frame_too_large",
+                                    message: "frame too large".into(),
+                                    detail: format!("{c} (frame limit {} bytes)", limits.max_frame_bytes),
+                                    receipt: None,
+                                });
+                            }
+                            return End::Silent("client went away");
+                        }
                         Some(Ok(Message::Close(_))) => return End::Silent("client closed"),
                         Some(Ok(Message::Text(t))) => Bytes::from(t),
                         Some(Ok(Message::Binary(b))) => b,

@@ -9,7 +9,7 @@ use std::time::Duration;
 use axum::extract::connect_info::Connected;
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{ConnectInfo, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::serve::{IncomingStream, Listener};
@@ -216,6 +216,7 @@ pub fn select_subprotocol<'a>(offered: impl Iterator<Item = &'a str>) -> Option<
 async fn ws_handler(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(PeerAddr(peer)): ConnectInfo<PeerAddr>,
+    headers: HeaderMap,
     mut ws: WebSocketUpgrade,
 ) -> Response {
     if shared.draining.load(Ordering::Acquire) {
@@ -226,7 +227,15 @@ async fn ws_handler(
         shared.metrics.error("too_many_connections");
         return (StatusCode::SERVICE_UNAVAILABLE, "too many connections\n").into_response();
     };
-    let chosen = select_subprotocol(ws.requested_protocols().filter_map(|v| v.to_str().ok()));
+    // From the raw header, not `WebSocketUpgrade::requested_protocols()`:
+    // axum keeps those in a sorted set, which loses the client's order of
+    // preference (it would pick v11.stomp for "v12.stomp, v11.stomp").
+    let chosen = select_subprotocol(
+        headers
+            .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+            .iter()
+            .filter_map(|v| v.to_str().ok()),
+    );
     if let Some(p) = chosen {
         ws.set_selected_protocol(HeaderValue::from_static(p));
     }
