@@ -31,6 +31,7 @@ fn auth_cfg(source: KeySource) -> AuthConfig {
         audience: None,
         leeway: Duration::from_secs(30),
         max_ttl: None,
+        sub_pattern: None,
     }
 }
 
@@ -773,4 +774,32 @@ async fn jwks_unreachable_is_not_ready() {
         &claims("d", 60),
     );
     assert_eq!(check(&a, &t).await, Err(AuthError::KeysUnavailable));
+}
+
+#[tokio::test]
+async fn sub_pattern_match_and_mismatch() {
+    let mut cfg = auth_cfg(KeySource::Hmac(SECRET.to_vec()));
+    cfg.sub_pattern =
+        Some(mpc_relay::config::compile_sub_pattern("device-[A-Za-z0-9_-]{1,64}").unwrap());
+    let a = hs(cfg);
+    let ok = hs_token(Algorithm::HS256, &claims("device-42", 60));
+    assert_eq!(check(&a, &ok).await.as_deref(), Ok("device-42"));
+    for sub in ["agent-0", "xdevice-1", "device-", "device-1.agent"] {
+        let t = hs_token(Algorithm::HS256, &claims(sub, 60));
+        let e = check(&a, &t).await.unwrap_err();
+        assert_eq!(e, AuthError::SubNotAllowed, "{sub}");
+        assert_eq!(e.reason(), "sub_not_allowed");
+    }
+}
+
+#[tokio::test]
+async fn sub_pattern_applies_without_verification_too() {
+    let mut cfg = auth_cfg(KeySource::Disabled);
+    cfg.sub_pattern = Some(mpc_relay::config::compile_sub_pattern("device-[0-9]+").unwrap());
+    let a = hs(cfg);
+    assert!(a.authenticate(Some("device-1"), None).await.is_ok());
+    assert_eq!(
+        a.authenticate(Some("agent-0"), None).await.unwrap_err(),
+        AuthError::SubNotAllowed
+    );
 }

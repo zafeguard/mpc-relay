@@ -264,3 +264,65 @@ fn secret_is_not_printed_by_debug() {
     let c = Config::from_vars(base()).unwrap();
     assert!(!format!("{c:?}").contains(SECRET));
 }
+
+#[test]
+fn sub_pattern_is_compiled_fully_anchored() {
+    let c = Config::from_vars(with(
+        base(),
+        "MPC_RELAY_SUB_PATTERN",
+        "device-[A-Za-z0-9_-]{1,64}",
+    ))
+    .unwrap();
+    let re = c.auth.sub_pattern.expect("set");
+    assert!(re.is_match("device-1"));
+    assert!(re.is_match("device-Abc_9-x"));
+    for no in [
+        "agent-0",
+        "xdevice-1",
+        "device-1 ",
+        "device-",
+        "agent-0;device-1",
+        "device-1\nagent-0",
+    ] {
+        assert!(!re.is_match(no), "{no:?} must not match");
+    }
+    // Anchoring wraps the whole pattern, so a top-level alternation cannot
+    // escape it the way `^a|b$` would.
+    let alt = mpc_relay::config::compile_sub_pattern("device-1|device-2").unwrap();
+    assert!(alt.is_match("device-2"));
+    assert!(!alt.is_match("device-1x"));
+    assert!(!alt.is_match("xdevice-2"));
+    // An operator who anchors it anyway gets the same thing.
+    let anchored = mpc_relay::config::compile_sub_pattern("^device-[0-9]+$").unwrap();
+    assert!(anchored.is_match("device-7"));
+    assert!(!anchored.is_match("device-7a"));
+}
+
+#[test]
+fn invalid_sub_pattern_refuses_to_start() {
+    for bad in ["device-[", "(unclosed", "a{2,1}", "*"] {
+        let e = Config::from_vars(with(base(), "MPC_RELAY_SUB_PATTERN", bad)).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                ConfigError::Invalid {
+                    var: "MPC_RELAY_SUB_PATTERN",
+                    ..
+                }
+            ),
+            "{bad}: {e:?}"
+        );
+    }
+}
+
+#[test]
+fn amqp_max_connections() {
+    assert_eq!(
+        Config::from_vars(base()).unwrap().amqp_max_connections,
+        None
+    );
+    let c = Config::from_vars(with(base(), "MPC_RELAY_AMQP_MAX_CONNECTIONS", "4")).unwrap();
+    assert_eq!(c.amqp_max_connections, Some(4));
+    assert!(Config::from_vars(with(base(), "MPC_RELAY_AMQP_MAX_CONNECTIONS", "0")).is_err());
+    assert!(Config::from_vars(with(base(), "MPC_RELAY_AMQP_MAX_CONNECTIONS", "many")).is_err());
+}

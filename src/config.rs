@@ -22,6 +22,7 @@ pub const KNOWN_VARS: &[&str] = &[
     "MPC_RELAY_TLS_KEY",
     "MPC_RELAY_AMQP_URL",
     "MPC_RELAY_AMQP_CONNECTION_NAME",
+    "MPC_RELAY_AMQP_MAX_CONNECTIONS",
     "MPC_RELAY_EXCHANGE",
     "MPC_RELAY_AUTH",
     "MPC_RELAY_JWT_SECRET",
@@ -33,6 +34,7 @@ pub const KNOWN_VARS: &[&str] = &[
     "MPC_RELAY_JWT_AUDIENCE",
     "MPC_RELAY_JWT_LEEWAY",
     "MPC_RELAY_JWT_MAX_TTL",
+    "MPC_RELAY_SUB_PATTERN",
     "MPC_RELAY_MAX_CONNECTIONS",
     "MPC_RELAY_MAX_SUBSCRIPTIONS",
     "MPC_RELAY_MAX_FRAME_BYTES",
@@ -112,6 +114,9 @@ pub struct AuthConfig {
     pub audience: Option<String>,
     pub leeway: Duration,
     pub max_ttl: Option<Duration>,
+    /// `MPC_RELAY_SUB_PATTERN`, compiled fully anchored: every `sub` must
+    /// match it as a whole.
+    pub sub_pattern: Option<regex::Regex>,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +167,9 @@ pub struct Config {
     pub tls: Option<TlsFiles>,
     pub amqp_url: String,
     pub amqp_connection_name: String,
+    /// `MPC_RELAY_AMQP_MAX_CONNECTIONS`: overrides the pool cap derived
+    /// from `max_connections` and the broker's `channel_max`.
+    pub amqp_max_connections: Option<usize>,
     pub exchange: String,
     pub auth: AuthConfig,
     pub limits: Limits,
@@ -184,6 +192,7 @@ impl Config {
             tls: None,
             amqp_url: amqp_url.into(),
             amqp_connection_name: "mpc-relay".into(),
+            amqp_max_connections: None,
             exchange: exchange.into(),
             auth: AuthConfig {
                 source,
@@ -191,6 +200,7 @@ impl Config {
                 audience: None,
                 leeway: Duration::from_secs(30),
                 max_ttl: None,
+                sub_pattern: None,
             },
             limits: Limits::default(),
             shutdown_grace: Duration::from_secs(20),
@@ -369,6 +379,14 @@ impl Config {
         if let Some(v) = get("MPC_RELAY_AMQP_CONNECTION_NAME") {
             cfg.amqp_connection_name = v;
         }
+        if env.contains_key("MPC_RELAY_AMQP_MAX_CONNECTIONS") {
+            cfg.amqp_max_connections =
+                Some(positive(&env, "MPC_RELAY_AMQP_MAX_CONNECTIONS", 1usize)?);
+        }
+        if let Some(v) = get("MPC_RELAY_SUB_PATTERN") {
+            cfg.auth.sub_pattern =
+                Some(compile_sub_pattern(&v).map_err(|r| invalid("MPC_RELAY_SUB_PATTERN", r))?);
+        }
         cfg.auth.issuer = get("MPC_RELAY_JWT_ISSUER");
         cfg.auth.audience = get("MPC_RELAY_JWT_AUDIENCE");
         cfg.auth.leeway = duration_or(&env, "MPC_RELAY_JWT_LEEWAY", cfg.auth.leeway)?;
@@ -418,6 +436,16 @@ impl Config {
         };
         Ok(cfg)
     }
+}
+
+/// Compile a `sub` pattern so it must match the whole value: wrapped as
+/// `^(?:pattern)$` whether or not the operator anchored it, so
+/// `device-[0-9]+` cannot be satisfied by `agent-0;device-1`.
+pub fn compile_sub_pattern(pattern: &str) -> Result<regex::Regex, String> {
+    regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+        .size_limit(1 << 20)
+        .build()
+        .map_err(|e| format!("not a valid regular expression: {e}"))
 }
 
 /// Exchange names are restricted to the AMQP-safe set so that

@@ -157,7 +157,7 @@ pub async fn start(cfg: Config) -> Relay {
     init_logs();
     let relay = mpc_relay::server::start(cfg).await.unwrap();
     for _ in 0..200 {
-        if relay.shared.broker.is_ready() {
+        if relay.shared.pool.is_ready() {
             return relay;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -628,6 +628,50 @@ impl Mgmt {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         false
+    }
+}
+
+impl Mgmt {
+    /// Broker-side names of the connections made as `user`. Works with
+    /// management statistics disabled.
+    pub async fn connection_names_of(&self, user: &str) -> Vec<String> {
+        let (_, v) = self
+            .get(&format!("/api/connections/username/{}", enc(user)))
+            .await;
+        let mut names: Vec<String> = v
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|c| c["name"].as_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Force-close one connection by its broker-side name.
+    pub async fn close_connection(&self, name: &str) -> bool {
+        let s = self
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/api/connections/{}", enc(name)),
+                None,
+            )
+            .await;
+        s == 204 || s == 200
+    }
+
+    /// Wait until `user` has exactly `n` connections; returns their names.
+    pub async fn wait_connections_of(&self, user: &str, n: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        for _ in 0..100 {
+            names = self.connection_names_of(user).await;
+            if names.len() == n {
+                return names;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("expected {n} connections for {user}, saw {names:?}");
     }
 }
 

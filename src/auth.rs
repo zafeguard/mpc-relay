@@ -77,6 +77,8 @@ pub enum AuthError {
     TtlTooLong,
     #[error("sub is not a valid node id")]
     InvalidSub,
+    #[error("sub does not match MPC_RELAY_SUB_PATTERN")]
+    SubNotAllowed,
 }
 
 impl AuthError {
@@ -99,6 +101,7 @@ impl AuthError {
             AuthError::InvalidClaim(_) => "invalid_claim",
             AuthError::TtlTooLong => "ttl_too_long",
             AuthError::InvalidSub => "invalid_sub",
+            AuthError::SubNotAllowed => "sub_not_allowed",
         }
     }
 }
@@ -447,6 +450,7 @@ impl Authenticator {
                 .filter(|l| !l.is_empty())
                 .ok_or(AuthError::MissingClaim("login".into()))?;
             validate_node_id(sub).map_err(|_| AuthError::InvalidSub)?;
+            self.check_sub_pattern(sub)?;
             return Ok(Identity {
                 principal: Principal {
                     sub: sub.to_owned(),
@@ -539,6 +543,15 @@ impl Authenticator {
             .map_err(map_jwt_error)
     }
 
+    /// `MPC_RELAY_SUB_PATTERN`: the operator's statement of which node ids
+    /// a device token may claim, so that none can claim an agent's.
+    fn check_sub_pattern(&self, sub: &str) -> Result<(), AuthError> {
+        match &self.cfg.sub_pattern {
+            Some(re) if !re.is_match(sub) => Err(AuthError::SubNotAllowed),
+            _ => Ok(()),
+        }
+    }
+
     /// Checks on top of the library's: types of the optional claims, `iat`,
     /// the lifetime cap, `sub` as a node id, and `sessions`.
     fn check_claims(&self, claims: Map<String, Value>) -> Result<Identity, AuthError> {
@@ -549,6 +562,7 @@ impl Authenticator {
             .and_then(Value::as_str)
             .ok_or_else(|| AuthError::MissingClaim("sub".into()))?;
         validate_node_id(sub).map_err(|_| AuthError::InvalidSub)?;
+        self.check_sub_pattern(sub)?;
         let exp = claims
             .get("exp")
             .and_then(Value::as_u64)

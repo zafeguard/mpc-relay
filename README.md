@@ -24,7 +24,7 @@ The device client is one implementation. It speaks STOMP over WebSocket either t
   └────┬─────┘  └────┬─────┘                           └────┬────┘ └────┬────┘
        │ wss://…/ws  │  STOMP 1.2 frames                    │ AMQP 0-9-1│
        │ JWT in CONNECT passcode                            │           │
-  ┌────▼─────────────▼────┐   one AMQP connection,   ┌──────▼───────────▼──────┐
+  ┌────▼─────────────▼────┐ pooled AMQP connections, ┌──────▼───────────▼──────┐
   │       mpc-relay       │   one channel per device │  RabbitMQ / Amazon MQ   │
   │  verify JWT → ACL →   ├─────────────────────────►│  exchange <EXCHANGE>    │
   │  queue/bind/consume   │   (amqps://, rustls)     │  (topic, durable,       │
@@ -105,6 +105,7 @@ Durations take `500ms`, `10s`, `5m` or `1h`; a bare number means seconds.
 | `MPC_RELAY_JWT_AUDIENCE` | – | Require this `aud` (a string, or an array containing it). |
 | `MPC_RELAY_JWT_LEEWAY` | `30s` | Clock-skew allowance for `exp`, `nbf` and `iat`. |
 | `MPC_RELAY_JWT_MAX_TTL` | – | Reject tokens whose `exp - iat` exceeds this. Makes `iat` required. |
+| `MPC_RELAY_SUB_PATTERN` | – | Regular expression every token's `sub` must match **as a whole**. The relay anchors it as `^(?:…)$` itself, so `device-[0-9]+` does not accept `xdevice-1`. Checked at CONNECT; an invalid expression stops the relay at startup. **Set it in production**, e.g. `^device-[A-Za-z0-9_-]{1,64}$`; see [Security model](#security-model). |
 
 ### Network
 
@@ -114,7 +115,8 @@ Durations take `500ms`, `10s`, `5m` or `1h`; a bare number means seconds.
 | `MPC_RELAY_WS_PATH` | `/ws` | WebSocket endpoint path. |
 | `MPC_RELAY_METRICS_LISTEN` | – | Serve `/metrics` on this separate address (and not on the main listener). |
 | `MPC_RELAY_TLS_CERT`, `MPC_RELAY_TLS_KEY` | – | PEM certificate chain and private key: serve `wss://` directly. Usually TLS terminates at a load balancer instead. |
-| `MPC_RELAY_AMQP_CONNECTION_NAME` | `mpc-relay` | Client-provided connection name shown in the broker's UI. |
+| `MPC_RELAY_AMQP_CONNECTION_NAME` | `mpc-relay` | Client-provided connection name shown in the broker's UI; pooled connections are named `<name>#0`, `<name>#1`, and so on. |
+| `MPC_RELAY_AMQP_MAX_CONNECTIONS` | derived | Most AMQP connections the pool opens. By default it is derived so the pool can carry `MPC_RELAY_MAX_CONNECTIONS` clients: `ceil(MPC_RELAY_MAX_CONNECTIONS / (channel_max - 2))`, which is 5 with RabbitMQ's default `channel_max` of 2047. |
 
 ### Limits
 
@@ -187,14 +189,16 @@ The relay is a security boundary in front of the broker. Devices never hold brok
 
 * **Authentication.** Every connection presents a JWT, verified against a configured secret or JWKS, before anything touches the broker. Failures are answered with a bare `ERROR authentication failed`. The reason goes to logs and to `mpc_relay_auth_failures_total{reason}`, never to the client.
 * **Authorisation.** Only the configured exchange is reachable; every other destination type is refused, as are wildcards (`*`, `#`) in routing keys. A device may **subscribe** only to `session.<S>.broadcast` and `session.<S>.node.<its sub>`, through the queue `mpc.session.<its sub>.<S>`. It may **send** to `session.<S>.broadcast` or `session.<S>.node.<any node>`. `<S>` must be a canonical lowercase UUID. The `sessions` claim narrows both.
-* **Exclusivity.** All devices share the relay's one AMQP connection, so the broker cannot tell two devices apart. The relay therefore enforces queue exclusivity itself: a second connection subscribing with a queue name another connection holds gets `ERROR resource locked`, as RabbitMQ answers RESOURCE_LOCKED across connections. Across relay instances, each has its own AMQP connection, so the broker's own check applies.
+* **Exclusivity.** Many devices share each of the relay's AMQP connections, so the broker cannot tell two devices apart. The relay therefore enforces queue exclusivity itself, process-wide across its whole pool: a second connection subscribing with a queue name another connection holds gets `ERROR resource locked`, as RabbitMQ answers RESOURCE_LOCKED across connections. Across relay instances, each has its own AMQP connections, so the broker's own check applies.
 * **Limits.** Connections, subscriptions, frame size, frame rate, connect and idle timeouts and write timeouts are all bounded. Deliveries are acknowledged only after they are written to the socket, so a slow client is held back by the broker's prefetch window, not buffered in the relay's memory.
 * **Token lifetime.** `exp` is enforced for the life of the connection, not only at CONNECT. Use short-lived tokens and `MPC_RELAY_JWT_MAX_TTL`.
 * **Configuration.** Unknown or empty `MPC_RELAY_*` variables are fatal, an HMAC secret must be at least 32 bytes, and a plain-`http` JWKS needs an explicit override.
 
 What the token issuer must get right:
 
-* `sub` values must be unique per device and must **never** equal an agent's node id. A token whose `sub` is an agent's id may subscribe to that agent's unicast key and queue name.
+* `sub` values must be unique per device and must **never** equal an agent's node id. The relay cannot tell an agent's node id from a device's: both are just node ids in routing keys. So a device token whose `sub` is an agent's id would be allowed to subscribe to `session.<S>.node.<that agent>` and its queue name, and receive that agent's unicast traffic. While the agent holds its queue, the broker refuses the second consumer with RESOURCE_LOCKED; when the agent is not connected, nothing does.
+
+  Set **`MPC_RELAY_SUB_PATTERN`** so that the relay itself enforces the split, rather than trusting every issuer to. Name devices and agents from disjoint namespaces (devices `device-…`, agents `agent-…`, say) and set the pattern to the device namespace only, for example `^device-[A-Za-z0-9_-]{1,64}$`. A token claiming an agent's id is then refused at CONNECT with `authentication failed` (reason `sub_not_allowed` in metrics and logs), however it was issued.
 * Any node may send to any node's unicast key within an allowed session; that is how devices reach agents. The MPC protocol's own message authentication is what makes a forged message harmless. The relay does not replace it.
 
 There are no cookies or ambient credentials, so cross-site WebSocket hijacking does not apply and the relay does not check `Origin`.
@@ -237,6 +241,7 @@ A device can send `SUBSCRIBE` (broadcast) then `SUBSCRIBE` (unicast, with `recei
 | `not supported` | Transactions, ACK/NACK, client ack modes, unknown commands. |
 | `frame too large`, `malformed frame` | Framing violations. |
 | `rate limit exceeded`, `too many subscriptions` | Limits. |
+| `too many connections` | Every AMQP connection the relay's pool may open is full. |
 | `connect timeout`, `idle timeout` | Timeouts. |
 | `not connected`, `already connected`, `unsupported protocol version`, `missing header`, `duplicate subscription id`, `subscription not found` | Protocol misuse. |
 | `broker unavailable` | The broker connection is down, the exchange does not exist yet, or the broker closed this client's channel. |
@@ -247,12 +252,12 @@ A device can send `SUBSCRIBE` (broadcast) then `SUBSCRIBE` (unicast, with `recei
 | Endpoint | Meaning |
 |---|---|
 | `GET /healthz` | 200 while the process is up. |
-| `GET /readyz` | 200 when the broker is connected, the exchange exists (checked with a passive declare at startup, on reconnect, and periodically), JWKS keys are loaded, and the relay is not draining. Otherwise 503. The JSON body says which condition failed. |
+| `GET /readyz` | 200 when at least one pooled AMQP connection is up and sees the exchange (checked with a passive declare on connect and periodically), JWKS keys are loaded, and the relay is not draining. Otherwise 503. The JSON body says which condition failed, how many AMQP connections are open, and the pool's cap. |
 | `GET /metrics` | Prometheus text format, on the main listener or on `MPC_RELAY_METRICS_LISTEN`. |
 
-Metrics: `mpc_relay_connections_active`, `mpc_relay_connections_total`, `mpc_relay_auth_failures_total{reason}`, `mpc_relay_frames_total{direction,command}`, `mpc_relay_publishes_total`, `mpc_relay_deliveries_total`, `mpc_relay_errors_total{reason}`, `mpc_relay_broker_connected`. Label values come from fixed sets, never from client input.
+Metrics: `mpc_relay_connections_active`, `mpc_relay_connections_total`, `mpc_relay_auth_failures_total{reason}`, `mpc_relay_frames_total{direction,command}`, `mpc_relay_publishes_total`, `mpc_relay_deliveries_total`, `mpc_relay_errors_total{reason}`, `mpc_relay_broker_connected` (1 while any pooled connection is up), plus `mpc_relay_amqp_connections` (open), `mpc_relay_amqp_pool_size` (opened so far) and `mpc_relay_amqp_channels_in_use` (sessions placed). Label values come from fixed sets, never from client input.
 
-**Broker loss.** Every client gets `ERROR broker unavailable` and is closed, `/readyz` turns 503, and the relay reconnects with capped exponential backoff (0.5 s doubling to 30 s, with jitter). Devices reconnect and resubscribe; their old exclusive queues died with the old connection.
+**Broker loss.** Each pooled connection is supervised on its own. When one drops, exactly the clients placed on it get `ERROR broker unavailable` and are closed; clients on the other connections are untouched. The lost connection reconnects independently with capped exponential backoff (0.5 s doubling to 30 s, with jitter). `/readyz` turns 503 only when no connection is up. Devices reconnect and resubscribe; their old exclusive queues died with the old connection.
 
 **Shutdown** (SIGTERM or SIGINT). `/readyz` turns 503 and new WebSockets are refused. Connected clients get `MPC_RELAY_SHUTDOWN_GRACE` to finish on their own. The rest receive `ERROR server shutting down`. Their queues are deleted, and the AMQP connection is closed.
 
@@ -263,7 +268,11 @@ The relay is stateless. Run as many instances as you like behind any TCP or HTTP
 * A client is pinned to the instance that accepted its WebSocket for the life of that connection. No sticky sessions or shared state are needed.
 * A device that reconnects may land anywhere. Exclusivity of a session queue across instances is enforced by the broker itself.
 * Set the load balancer's idle timeout above `MPC_RELAY_PING_INTERVAL`. The relay's pings are the traffic that keeps idle WebSockets open.
-* Each instance holds **one** AMQP connection and **one channel per client**. RabbitMQ's default `channel_max` is 2047, so one instance can serve at most about 2,000 concurrent clients however high `MPC_RELAY_MAX_CONNECTIONS` is set. Beyond that, CONNECT is answered with `ERROR too many connections`. Scale out, or raise `channel_max` on the broker. The negotiated value is logged at startup.
+* Each client session needs **one AMQP channel**, and one AMQP connection carries at most the broker's `channel_max` channels (2047 by default on RabbitMQ). So each instance keeps a **pool** of AMQP connections:
+  * The first is opened at startup and the rest lazily, when every live connection is full.
+  * A session goes on the first live connection with a free channel. Two channels per connection are kept back for the relay's own short-lived channels.
+  * The pool is capped so its total capacity matches `MPC_RELAY_MAX_CONNECTIONS`, or at `MPC_RELAY_AMQP_MAX_CONNECTIONS` if set. When every connection it may open is full, CONNECT is answered with `ERROR too many connections`.
+  * The negotiated `channel_max`, per-connection capacity and cap are logged as each connection opens. Mind the broker's own per-user or per-vhost connection limits when sizing.
 
 ## Limitations
 
@@ -271,6 +280,8 @@ The relay is stateless. Run as many instances as you like behind any TCP or HTTP
 * Delivery is at-most-once towards a client that disconnects mid-stream: its queue is deleted with it, as with Web-STOMP.
 * Within one connection, frames are processed one at a time. A SEND with a receipt waits for the publisher confirm before the next frame is read (about one broker round trip).
 * JWKS keys: RSA (RS256), EC P-256 (ES256) and Ed25519 (EdDSA) only.
+* Pooled AMQP connections opened for a peak stay open (and reconnect) after the peak passes; they are not retired when idle.
+* A STOMP frame larger than the WebSocket message limit (frame limit + 64 KiB) is refused before it is buffered and answered with `ERROR frame too large`. A client still writing a very large message when that happens can lose the ERROR to the TCP reset, and sees only the connection close.
 * The relay does not see client IPs behind a proxy (no `X-Forwarded-For` handling); its logs show the proxy's address.
 
 ## Development

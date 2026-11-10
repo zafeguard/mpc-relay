@@ -36,13 +36,13 @@ use lapin::protocol::{AMQPErrorKind, AMQPSoftError};
 use lapin::publisher_confirm::Confirmation;
 use lapin::types::FieldTable;
 use lapin::{acker::Acker, BasicProperties, Channel, Connection};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::acl;
 use crate::auth::{Authenticator, Identity};
-use crate::broker::Broker;
+use crate::broker::{AcquireError, Lease, Pool, SlotState};
 use crate::codec::{CodecError, Decoder, Frame};
 use crate::config::Config;
 use crate::metrics::Metrics;
@@ -64,8 +64,8 @@ pub const SERVER_NAME: &str = concat!("mpc-relay/", env!("CARGO_PKG_VERSION"));
 
 /// Which client connection holds each session queue.
 ///
-/// All clients share the relay's one AMQP connection, so the broker's
-/// exclusive-queue check cannot tell them apart. This registry is that check:
+/// Clients share the relay's pooled AMQP connections, so the broker's
+/// exclusive-queue check cannot tell two clients on one connection apart. This registry is that check:
 /// a second connection subscribing with a queue name another connection
 /// holds is refused, as RabbitMQ refuses it with RESOURCE_LOCKED across
 /// connections. A queue is released only after its deletion has been
@@ -113,7 +113,7 @@ impl QueueRegistry {
 pub struct Shared {
     pub config: Arc<Config>,
     pub auth: Arc<Authenticator>,
-    pub broker: Arc<Broker>,
+    pub pool: Arc<Pool>,
     pub metrics: Arc<Metrics>,
     pub registry: QueueRegistry,
     /// Cancelled to end every client session ("server shutting down").
@@ -127,13 +127,13 @@ impl Shared {
     pub fn new(
         config: Arc<Config>,
         auth: Arc<Authenticator>,
-        broker: Arc<Broker>,
+        pool: Arc<Pool>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Shared {
             config,
             auth,
-            broker,
+            pool,
             metrics,
             registry: QueueRegistry::default(),
             shutdown: CancellationToken::new(),
@@ -623,6 +623,9 @@ struct Subscription {
 
 struct Connected {
     identity: Identity,
+    /// This session's place on a pooled connection; freed when dropped,
+    /// after cleanup.
+    lease: Lease,
     connection: Arc<Connection>,
     channel: Channel,
     generation: u64,
@@ -643,6 +646,9 @@ struct Session {
     connected: Option<Connected>,
     /// Handed to the read loop once CONNECT succeeds.
     new_events: Option<mpsc::Receiver<DispatchEvent>>,
+    /// The state of the pooled connection the session was placed on, also
+    /// handed over at CONNECT.
+    new_slot_watch: Option<watch::Receiver<SlotState>>,
 }
 
 /// Serve one upgraded WebSocket until it ends.
@@ -667,6 +673,7 @@ pub async fn serve(ws: WebSocket, shared: Arc<Shared>, slot: ConnectionSlot, pee
         bucket: TokenBucket::new(limits.send_rate, limits.send_burst),
         connected: None,
         new_events: None,
+        new_slot_watch: None,
     };
     let mut stream = stream;
     let end = session.read_loop(&mut stream).await;
@@ -678,9 +685,15 @@ pub async fn serve(ws: WebSocket, shared: Arc<Shared>, slot: ConnectionSlot, pee
     // in flight) would get a TCP reset, and a reset lets the client's stack
     // discard the ERROR frame it has not read yet.
     let _ = tokio::time::timeout(CLOSE_LINGER, async {
-        while let Some(Ok(msg)) = stream.next().await {
-            if let Message::Close(_) = msg {
-                break;
+        loop {
+            match stream.next().await {
+                None | Some(Ok(Message::Close(_))) => break,
+                Some(Ok(_)) => continue,
+                // After a read error (an oversized message, say) the stream
+                // cannot be drained, and closing now would reset the
+                // connection under the ERROR the client has not read yet.
+                // Hold it open for the rest of the linger instead.
+                Some(Err(_)) => pending::<()>().await,
             }
         }
     })
@@ -720,6 +733,17 @@ async fn sleep_until_opt(t: Option<Instant>) {
     }
 }
 
+/// Resolves when the watched pooled connection changes state; `Err` if the
+/// pool dropped it.
+async fn slot_changed(
+    rx: &mut Option<watch::Receiver<SlotState>>,
+) -> Result<(), watch::error::RecvError> {
+    match rx {
+        Some(rx) => rx.changed().await,
+        None => pending().await,
+    }
+}
+
 async fn recv_opt(rx: &mut Option<mpsc::Receiver<DispatchEvent>>) -> Option<DispatchEvent> {
     match rx {
         Some(rx) => rx.recv().await,
@@ -732,7 +756,9 @@ impl Session {
         let limits = self.shared.config.limits.clone();
         let shutdown = self.shared.shutdown.clone();
         let out = self.out.clone();
-        let mut broker = self.shared.broker.watch();
+        // Only the pooled connection this session sits on matters to it:
+        // another connection dropping must not end it.
+        let mut slot_watch: Option<watch::Receiver<SlotState>> = None;
         let mut events: Option<mpsc::Receiver<DispatchEvent>> = None;
         let connect_deadline = Instant::now() + limits.connect_timeout;
         let idle = tokio::time::sleep(limits.idle_timeout);
@@ -754,9 +780,9 @@ impl Session {
                     });
                 }
                 _ = out.closed() => return End::Silent("websocket write side closed"),
-                changed = broker.changed(), if connected => {
+                changed = slot_changed(&mut slot_watch), if connected => {
                     let lost = changed.is_err() || {
-                        let s = broker.borrow_and_update();
+                        let s = slot_watch.as_mut().expect("watched while connected").borrow_and_update();
                         Some(s.generation) != generation
                             || !s.connection.as_ref().is_some_and(|c| c.status().connected())
                     };
@@ -845,6 +871,9 @@ impl Session {
                                 }
                                 if events.is_none() {
                                     events = self.new_events.take();
+                                }
+                                if slot_watch.is_none() {
+                                    slot_watch = self.new_slot_watch.take();
                                 }
                             }
                             Err(e @ CodecError::FrameTooLarge { .. }) => {
@@ -956,9 +985,28 @@ impl Session {
                 "MPC_RELAY_AUTH=none: connection accepted WITHOUT authentication - never run this in production"
             );
         }
-        let Some((connection, generation)) = self.shared.broker.ready_connection() else {
-            return broker_unavailable_opt();
+        let lease = match self.shared.pool.acquire().await {
+            Ok(lease) => lease,
+            Err(AcquireError::Unavailable) => return broker_unavailable_opt(),
+            Err(AcquireError::Full) => {
+                return fail(
+                    "pool_full",
+                    "too many connections",
+                    "every AMQP connection this relay may open is full",
+                    &none,
+                )
+            }
         };
+        let (connection, generation) = (lease.connection.clone(), lease.generation);
+        // Subscribe, then confirm the connection is still the one leased: a
+        // loss between the two would otherwise never be signalled.
+        let slot_watch = lease.slot().watch();
+        {
+            let s = slot_watch.borrow();
+            if s.generation != generation || !s.connected() {
+                return broker_unavailable_opt();
+            }
+        }
         let prefetch = self.shared.config.limits.prefetch;
         let channel = match open_channel(&connection, prefetch).await {
             Ok(ch) => ch,
@@ -986,9 +1034,10 @@ impl Session {
         let dispatcher_task = tokio::spawn(dispatcher.run(cmd_rx));
         let leeway = self.shared.config.auth.leeway;
         let expiry = identity.expires_at.map(|exp| expiry_deadline(exp, leeway));
-        tracing::info!(conn = self.conn_id, peer = %self.peer, sub = %identity.principal.sub, version, "connected");
+        tracing::info!(conn = self.conn_id, peer = %self.peer, sub = %identity.principal.sub, version, amqp_slot = lease.slot().index, "connected");
         self.connected = Some(Connected {
             identity,
+            lease,
             connection,
             channel,
             generation,
@@ -999,6 +1048,7 @@ impl Session {
             queues: HashMap::new(),
         });
         self.new_events = Some(ev_rx);
+        self.new_slot_watch = Some(slot_watch);
         self.emit(
             Frame::new("CONNECTED")
                 .with_header("version", version)
@@ -1345,8 +1395,9 @@ async fn open_channel(conn: &Connection, prefetch: u16) -> Result<Channel, Broke
 async fn cleanup(shared: &Shared, conn_id: u64, c: Connected) {
     c.dispatcher_task.abort();
     let queues: Vec<String> = c.queues.keys().cloned().collect();
-    let same_connection = shared
-        .broker
+    let same_connection = c
+        .lease
+        .slot()
         .state()
         .connection
         .as_ref()

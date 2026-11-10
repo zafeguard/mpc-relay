@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::Authenticator;
 use crate::bridge::{self, Shared};
-use crate::broker::{redact_amqp_url, Broker};
+use crate::broker::{redact_amqp_url, Pool, PoolSettings};
 use crate::config::{Config, TlsFiles};
 use crate::metrics::Metrics;
 
@@ -167,12 +167,10 @@ async fn healthz() -> &'static str {
 }
 
 async fn readyz(State(shared): State<Arc<Shared>>) -> Response {
-    let state = shared.broker.state();
-    let broker = state
-        .connection
-        .as_ref()
-        .is_some_and(|c| c.status().connected());
-    let exchange = broker && state.exchange_ok;
+    let connections = shared.pool.connected_count();
+    let broker = connections > 0;
+    // At least one connection that is up and sees the exchange.
+    let exchange = shared.pool.is_ready();
     let keys = shared.auth.is_ready();
     let draining = shared.draining.load(Ordering::Acquire);
     let ready = broker && exchange && keys && !draining;
@@ -182,6 +180,8 @@ async fn readyz(State(shared): State<Arc<Shared>>) -> Response {
         "exchange": exchange,
         "keys": keys,
         "draining": draining,
+        "amqp_connections": connections,
+        "amqp_pool_cap": shared.pool.cap(),
     });
     let status = if ready {
         StatusCode::OK
@@ -271,14 +271,18 @@ pub async fn start(config: Config) -> anyhow::Result<Relay> {
     let tls = config.tls.as_ref().map(load_tls).transpose()?;
 
     let auth = Authenticator::new(config.auth.clone(), stop_broker.clone())?;
-    let broker = Broker::start(
-        config.amqp_url.clone(),
-        config.amqp_connection_name.clone(),
-        config.exchange.clone(),
+    let pool = Pool::start(
+        PoolSettings {
+            amqp_url: config.amqp_url.clone(),
+            connection_name: config.amqp_connection_name.clone(),
+            exchange: config.exchange.clone(),
+            max_clients: config.limits.max_connections,
+            max_connections: config.amqp_max_connections,
+        },
         metrics.clone(),
         stop_broker.clone(),
     );
-    let shared = Arc::new(Shared::new(config.clone(), auth, broker, metrics));
+    let shared = Arc::new(Shared::new(config.clone(), auth, pool, metrics));
 
     let mut servers = Vec::new();
     let listener = TcpListener::bind(config.listen).await?;
@@ -364,16 +368,8 @@ impl Relay {
         for s in self.servers {
             let _ = tokio::time::timeout(Duration::from_secs(5), s).await;
         }
-        // Give the supervisor a moment to close the AMQP connection cleanly.
-        let mut rx = self.shared.broker.watch();
-        let _ = tokio::time::timeout(Duration::from_secs(5), async {
-            while rx.borrow_and_update().connection.is_some() {
-                if rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        })
-        .await;
+        // Give the slots a moment to close their AMQP connections cleanly.
+        self.shared.pool.wait_closed(Duration::from_secs(5)).await;
         tracing::info!("stopped");
     }
 }

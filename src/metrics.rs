@@ -13,6 +13,9 @@ pub struct Metrics {
     pub deliveries: IntCounter,
     pub errors: IntCounterVec,
     pub broker_connected: IntGauge,
+    pub amqp_connections: IntGauge,
+    pub amqp_pool_size: IntGauge,
+    pub amqp_channels_in_use: IntGauge,
 }
 
 /// STOMP commands that get their own `command` label value; anything else
@@ -92,7 +95,22 @@ impl Metrics {
         .expect("metric");
         let broker_connected = IntGauge::new(
             "mpc_relay_broker_connected",
-            "1 while the AMQP connection is up, else 0",
+            "1 while at least one pooled AMQP connection is up, else 0",
+        )
+        .expect("metric");
+        let amqp_connections = IntGauge::new(
+            "mpc_relay_amqp_connections",
+            "Pooled AMQP connections currently open",
+        )
+        .expect("metric");
+        let amqp_pool_size = IntGauge::new(
+            "mpc_relay_amqp_pool_size",
+            "AMQP connections the pool has opened or is keeping open",
+        )
+        .expect("metric");
+        let amqp_channels_in_use = IntGauge::new(
+            "mpc_relay_amqp_channels_in_use",
+            "Client sessions placed on pooled AMQP connections (one channel each)",
         )
         .expect("metric");
         for c in [
@@ -104,6 +122,9 @@ impl Metrics {
             Box::new(deliveries.clone()),
             Box::new(errors.clone()),
             Box::new(broker_connected.clone()),
+            Box::new(amqp_connections.clone()),
+            Box::new(amqp_pool_size.clone()),
+            Box::new(amqp_channels_in_use.clone()),
         ] {
             registry.register(c).expect("unique metric names");
         }
@@ -117,6 +138,9 @@ impl Metrics {
             deliveries,
             errors,
             broker_connected,
+            amqp_connections,
+            amqp_pool_size,
+            amqp_channels_in_use,
         }
     }
 

@@ -153,12 +153,13 @@ async fn oversize_and_malformed_frames() {
     s.send_text("SEND\ncontent-length:999999\n\n").await;
     s.expect_error("frame too large").await;
 
-    // Far beyond the WebSocket message limit, as one message: refused by
-    // the WebSocket layer before it is buffered, and still answered with
-    // a STOMP ERROR.
+    // Beyond the WebSocket message limit (frame limit + 64 KiB), as one
+    // message: refused by the WebSocket layer before it is buffered, and
+    // still answered with a STOMP ERROR. Kept small enough to fit in
+    // loopback socket buffers, so the client's own write completes.
     let mut s = Stomp::open(r.local_addr, None).await;
     let mut huge = b"SEND\ndestination:/x\n\n".to_vec();
-    huge.extend(vec![b'A'; 512 * 1024]);
+    huge.extend(vec![b'A'; 80 * 1024]);
     huge.push(0);
     s.send_raw(huge).await;
     s.expect_error("frame too large").await;
@@ -338,4 +339,36 @@ async fn tls_listener() {
     assert!(resp.ends_with("ok\n"), "{resp}");
     r.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn sub_pattern_is_checked_at_connect() {
+    let r = relay(|c| {
+        c.auth.sub_pattern =
+            Some(mpc_relay::config::compile_sub_pattern("device-[A-Za-z0-9_-]{1,64}").unwrap())
+    })
+    .await;
+    // An agent's id is refused before anything touches the broker.
+    let err = Stomp::connect(r.local_addr, &token("agent-0"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.header("message"), Some("authentication failed"));
+    assert_eq!(
+        &err.body[..],
+        b"authentication failed",
+        "no detail on the wire"
+    );
+    let metrics = r.shared.metrics.render();
+    assert!(
+        metrics.contains(r#"mpc_relay_auth_failures_total{reason="sub_not_allowed"} 1"#),
+        "{metrics}"
+    );
+    // A matching sub gets past authentication (and then finds no broker).
+    let err = Stomp::connect(r.local_addr, &token("device-7"))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.header("message"), Some("broker unavailable"));
+    r.shutdown().await;
 }

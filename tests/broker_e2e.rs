@@ -1017,39 +1017,243 @@ async fn a_channel_closed_by_the_broker_ends_the_session_promptly() {
     fx.teardown().await;
 }
 
-/// One AMQP connection carries every client's channel, so the broker's
-/// `channel_max` caps concurrent clients per relay regardless of
-/// MPC_RELAY_MAX_CONNECTIONS. Past it, CONNECT gets a clear ERROR.
+/// A connection with `channel_max=3` carries one session (two channels
+/// are kept back), so every further session needs another connection.
+fn tiny_channel_max(url: &str) -> String {
+    format!("{url}?channel_max=3")
+}
+
+/// Subscribe `c` (node `me`) to a fresh session and prove a raw publish to
+/// its broadcast key reaches it.
+async fn prove_session_works(fx: &Fixture, c: &mut Stomp, me: &str) {
+    let s = session();
+    let (bcast, node) = keys(&s, me);
+    c.subscribe("b", &fx.dest(&bcast), &qname(me, &s), None)
+        .await;
+    c.subscribe("n", &fx.dest(&node), &qname(me, &s), Some("ok"))
+        .await;
+    let ch = fx.channel().await;
+    publish(
+        &ch,
+        &fx.exchange,
+        &bcast,
+        format!("to {me}").as_bytes(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8_lossy(&c.expect("MESSAGE").await.body),
+        format!("to {me}")
+    );
+    let _ = ch.close(200, "ok").await;
+}
+
+/// The pool opens connections only when the live ones are full, places
+/// sessions beyond one connection's channel_max on the next, and reuses
+/// freed places before opening more.
 #[tokio::test]
-async fn channel_max_caps_clients_per_relay() {
+async fn pool_opens_connections_lazily_and_spreads_sessions() {
     let url = require_broker!();
-    let capped = format!("{url}?channel_max=3");
-    let fx = Fixture::with_config(url.clone(), |c| c.amqp_url = capped.clone()).await;
-    let mut held = Vec::new();
-    let mut refused = None;
-    for i in 0..6 {
-        match Stomp::connect(fx.addr, &token(&format!("d{i}"))).await {
-            Ok(c) => held.push(c),
-            Err(f) => {
-                refused = Some(f);
-                break;
-            }
-        }
+    let capped = tiny_channel_max(&url);
+    let fx = Fixture::with_config(url.clone(), |c| {
+        c.amqp_url = capped.clone();
+        c.limits.max_connections = 3; // => pool cap ceil(3 / 1) = 3
+    })
+    .await;
+    let pool = fx.relay.as_ref().unwrap().shared.pool.clone();
+    let snap = pool.snapshot();
+    assert_eq!(
+        snap.len(),
+        1,
+        "only the first connection is opened at startup: {snap:?}"
+    );
+    assert_eq!(snap[0].capacity, 1, "channel_max 3 minus the margin of 2");
+    assert_eq!(pool.cap(), 3);
+
+    let mut clients = Vec::new();
+    for i in 0..3 {
+        let me = format!("d{i}");
+        let mut c = fx.connect(&me).await;
+        prove_session_works(&fx, &mut c, &me).await;
+        clients.push(c);
+        assert_eq!(
+            pool.snapshot().len(),
+            i + 1,
+            "a connection per session once each is full"
+        );
     }
-    let f = refused.expect("a client beyond channel_max is refused");
-    assert_eq!(f.header("message"), Some("too many connections"));
-    assert!(held.len() <= 3, "{} clients on channel_max=3", held.len());
-    // A freed channel is reusable.
-    drop(held.pop());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let mut ok = false;
-    for _ in 0..20 {
-        if Stomp::connect(fx.addr, &token("again")).await.is_ok() {
-            ok = true;
+    let snap = pool.snapshot();
+    assert!(
+        snap.iter().all(|s| s.connected && s.sessions == 1),
+        "{snap:?}"
+    );
+    let metrics = fx.relay.as_ref().unwrap().shared.metrics.render();
+    assert!(
+        metrics.contains("mpc_relay_amqp_connections 3"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("mpc_relay_amqp_channels_in_use 3"),
+        "{metrics}"
+    );
+
+    // The client limit still applies on top: a fourth WebSocket is refused.
+    match tokio_tungstenite::connect_async(format!("ws://{}/ws", fx.addr)).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => assert_eq!(resp.status(), 503),
+        other => panic!("expected HTTP 503, got {other:?}"),
+    }
+
+    // A freed place is reused: no fourth connection.
+    clients.pop().unwrap().close().await;
+    let mut freed = false;
+    for _ in 0..50 {
+        if pool.snapshot().iter().any(|s| s.sessions == 0) {
+            freed = true;
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(ok, "a channel freed by a departed client is reused");
+    assert!(freed, "the departed session's place was released");
+    let mut c = fx.connect("d9").await;
+    prove_session_works(&fx, &mut c, "d9").await;
+    assert_eq!(pool.snapshot().len(), 3);
     fx.teardown().await;
+}
+
+/// MPC_RELAY_AMQP_MAX_CONNECTIONS overrides the derived cap; past it,
+/// CONNECT gets a clear ERROR.
+#[tokio::test]
+async fn pool_cap_override_refuses_beyond_capacity() {
+    let url = require_broker!();
+    let capped = tiny_channel_max(&url);
+    let fx = Fixture::with_config(url.clone(), |c| {
+        c.amqp_url = capped.clone();
+        c.limits.max_connections = 50;
+        c.amqp_max_connections = Some(2);
+    })
+    .await;
+    let pool = fx.relay.as_ref().unwrap().shared.pool.clone();
+    let mut held = Vec::new();
+    for i in 0..2 {
+        let me = format!("d{i}");
+        let mut c = fx.connect(&me).await;
+        prove_session_works(&fx, &mut c, &me).await;
+        held.push(c);
+    }
+    assert_eq!(pool.cap(), 2);
+    let err = Stomp::connect(fx.addr, &token("d2"))
+        .await
+        .err()
+        .expect("refused");
+    assert_eq!(err.header("message"), Some("too many connections"));
+    assert_eq!(pool.snapshot().len(), 2, "no connection beyond the cap");
+    let metrics = fx.relay.as_ref().unwrap().shared.metrics.render();
+    assert!(
+        metrics.contains(r#"mpc_relay_errors_total{reason="pool_full"} 1"#),
+        "{metrics}"
+    );
+    fx.teardown().await;
+}
+
+/// One pooled connection dropping ends exactly the sessions on it; the
+/// others carry on, the relay stays ready, and the lost connection comes
+/// back on its own.
+#[tokio::test]
+async fn losing_one_pooled_connection_drops_only_its_sessions() {
+    let url = require_broker!();
+    let Some(m) = mgmt() else {
+        eprintln!("SKIPPED: needs MPC_RELAY_TEST_MGMT_URL to close one of the relay's connections");
+        return;
+    };
+    let vh = vhost(&url);
+    let user = unique("relay-pool");
+    m.create_user(&vh, &user, "pool-test").await;
+    let relay_url = tiny_channel_max(&with_credentials(&url, &user, "pool-test"));
+    let fx = Fixture::with_config(url.clone(), |c| c.amqp_url = relay_url.clone()).await;
+    let pool = fx.relay.as_ref().unwrap().shared.pool.clone();
+    m.wait_connections_of(&user, 1).await;
+
+    // Two sessions; with one place per connection they sit on two
+    // connections.
+    let mut a = fx.connect("dev-a").await;
+    prove_session_works(&fx, &mut a, "dev-a").await;
+    let mut b = fx.connect("dev-b").await;
+    prove_session_works(&fx, &mut b, "dev-b").await;
+    let names = m.wait_connections_of(&user, 2).await;
+    let before = pool.snapshot();
+    assert_eq!(before.len(), 2);
+    assert!(
+        before.iter().all(|s| s.sessions == 1 && s.generation == 1),
+        "{before:?}"
+    );
+
+    // Kill one of them, from the broker side.
+    assert!(m.close_connection(&names[0]).await);
+    let http = reqwest::Client::new();
+    let readyz = format!("http://{}/readyz", fx.addr);
+    let ra = a.recv_within(Duration::from_secs(3)).await;
+    let rb = b.recv_within(Duration::from_millis(500)).await;
+    let is_err = |r: &Result<Option<Frame>, ()>| matches!(r, Ok(Some(f)) if f.command == "ERROR" && f.header("message") == Some("broker unavailable"));
+    let (mut survivor, survivor_name) = match (is_err(&ra), is_err(&rb)) {
+        (true, false) => {
+            assert!(rb.is_err(), "the other session saw nothing: {rb:?}");
+            (b, "dev-b")
+        }
+        (false, true) => {
+            assert!(ra.is_err(), "the other session saw nothing: {ra:?}");
+            (a, "dev-a")
+        }
+        other => panic!("exactly one session must be dropped, got {other:?} ({ra:?}, {rb:?})"),
+    };
+    // Still ready: the other connection is up.
+    assert_eq!(http.get(&readyz).send().await.unwrap().status(), 200);
+    // The survivor's session still works end to end.
+    let s = session();
+    let (bcast, node) = keys(&s, survivor_name);
+    survivor
+        .subscribe("b2", &fx.dest(&bcast), &qname(survivor_name, &s), None)
+        .await;
+    survivor
+        .subscribe("n2", &fx.dest(&node), &qname(survivor_name, &s), Some("ok"))
+        .await;
+    let ch = fx.channel().await;
+    publish(&ch, &fx.exchange, &bcast, b"still here", None).await;
+    assert_eq!(&survivor.expect("MESSAGE").await.body[..], b"still here");
+
+    // The killed connection reconnects by itself; the survivor's never
+    // reconnected.
+    let mut after = pool.snapshot();
+    for _ in 0..100 {
+        after = pool.snapshot();
+        if after.iter().all(|s| s.connected) && after.iter().any(|s| s.generation == 2) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut generations: Vec<u64> = after.iter().map(|s| s.generation).collect();
+    generations.sort();
+    assert_eq!(
+        generations,
+        vec![1, 2],
+        "only the killed connection reconnected: {after:?}"
+    );
+    let reconnected = after.iter().find(|s| s.generation == 2).unwrap();
+    assert_eq!(reconnected.sessions, 0, "its session was dropped with it");
+    m.wait_connections_of(&user, 2).await;
+    let metrics = fx.relay.as_ref().unwrap().shared.metrics.render();
+    assert!(
+        metrics.contains(r#"mpc_relay_errors_total{reason="broker_unavailable"} 1"#),
+        "{metrics}"
+    );
+
+    // And it takes new sessions again.
+    let mut c = fx.connect("dev-c").await;
+    prove_session_works(&fx, &mut c, "dev-c").await;
+    assert_eq!(
+        pool.snapshot().len(),
+        2,
+        "placed on the reconnected connection, not a new one"
+    );
+    fx.teardown().await;
+    m.delete_user(&user).await;
 }

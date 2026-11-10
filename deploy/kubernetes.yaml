@@ -80,6 +80,11 @@ spec:
               value: json
             - name: MPC_RELAY_JWT_MAX_TTL
               value: 15m
+            # Device tokens may only claim device node ids, never an agent's
+            # (which would let a device receive that agent's unicasts). Use
+            # your own naming scheme; the relay anchors it to the whole sub.
+            - name: MPC_RELAY_SUB_PATTERN
+              value: "^device-[A-Za-z0-9_-]{1,64}$"
             - name: RUST_LOG
               value: info
           ports:
