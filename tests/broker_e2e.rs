@@ -1188,7 +1188,9 @@ async fn losing_one_pooled_connection_drops_only_its_sessions() {
     );
 
     // Kill one of them, from the broker side.
-    assert!(m.close_connection(&names[0]).await);
+    if let Err(why) = m.close_connection(&names[0]).await {
+        panic!("could not close one of the relay's connections: {why}");
+    }
     let http = reqwest::Client::new();
     let readyz = format!("http://{}/readyz", fx.addr);
     let ra = a.recv_within(Duration::from_secs(3)).await;

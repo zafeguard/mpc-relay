@@ -649,16 +649,48 @@ impl Mgmt {
         names
     }
 
-    /// Force-close one connection by its broker-side name.
-    pub async fn close_connection(&self, name: &str) -> bool {
-        let s = self
-            .send(
-                reqwest::Method::DELETE,
-                &format!("/api/connections/{}", enc(name)),
-                None,
-            )
-            .await;
-        s == 204 || s == 200
+    /// Force-close one connection by its broker-side name. `Err` carries
+    /// the request, status and body of the last attempt, so a failure says
+    /// why.
+    ///
+    /// Retries on 404. The names come from `/api/connections/username/..`,
+    /// which reads the broker's connection-tracking table and lists a
+    /// connection the moment it opens. With management statistics enabled
+    /// (the default), `DELETE /api/connections/{name}` instead looks the
+    /// connection up in the statistics database, which learns of it only at
+    /// the next statistics emission (`collect_statistics_interval`, 5 s by
+    /// default). Until then the DELETE answers 404 for a connection that
+    /// exists. With statistics disabled both read the tracking table, which
+    /// is why this only showed on a stats-enabled broker.
+    pub async fn close_connection(&self, name: &str) -> Result<(), String> {
+        let path = format!("/api/connections/{}", enc(name));
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(15);
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            let r = self
+                .http
+                .delete(format!("{}{}", self.base, path))
+                .basic_auth(&self.user, Some(&self.pass))
+                .header("X-Reason", "test: simulated loss of one pooled connection")
+                .send()
+                .await
+                .map_err(|e| format!("DELETE {path}: {e}"))?;
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            if status.is_success() {
+                return Ok(());
+            }
+            if status != reqwest::StatusCode::NOT_FOUND || tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "DELETE {path} (connection {name:?}) -> {status}: {body} \
+                     (attempt {attempts}, {:?} after the first)",
+                    started.elapsed()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     /// Wait until `user` has exactly `n` connections; returns their names.
