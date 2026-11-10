@@ -10,6 +10,7 @@ pub struct Metrics {
     pub auth_failures: IntCounterVec,
     pub frames: IntCounterVec,
     pub publishes: IntCounter,
+    pub publish_nacks: IntCounter,
     pub deliveries: IntCounter,
     pub errors: IntCounterVec,
     pub broker_connected: IntGauge,
@@ -80,6 +81,11 @@ impl Metrics {
             "Messages published to the broker on behalf of clients",
         )
         .expect("metric");
+        let publish_nacks = IntCounter::new(
+            "mpc_relay_publish_nacks_total",
+            "Publisher confirms that came back negative. A trickle at session teardown is expected: a device's exclusive queue is deleted while a broadcast to it is still being routed, and the peers still running receive it",
+        )
+        .expect("metric");
         let deliveries = IntCounter::new(
             "mpc_relay_deliveries_total",
             "Broker messages delivered to clients as MESSAGE frames",
@@ -119,6 +125,7 @@ impl Metrics {
             Box::new(auth_failures.clone()),
             Box::new(frames.clone()),
             Box::new(publishes.clone()),
+            Box::new(publish_nacks.clone()),
             Box::new(deliveries.clone()),
             Box::new(errors.clone()),
             Box::new(broker_connected.clone()),
@@ -135,6 +142,7 @@ impl Metrics {
             auth_failures,
             frames,
             publishes,
+            publish_nacks,
             deliveries,
             errors,
             broker_connected,

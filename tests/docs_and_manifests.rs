@@ -3,7 +3,7 @@
 //! stale name in a manifest would be a node that cannot start - and nothing
 //! else compiles these files.
 
-use mpc_relay::config::KNOWN_VARS;
+use mpc_relay::config::{is_kubernetes_service_link, KNOWN_VARS};
 
 /// Misspellings the README uses on purpose, to show what is refused.
 const DELIBERATE_TYPOS: &[&str] = &["MPC_RELAY_JWT_ISUER"];
@@ -37,6 +37,7 @@ fn documented_and_deployed_variables_exist() {
             if name == "MPC_RELAY"
                 || name.starts_with("MPC_RELAY_TEST_")
                 || DELIBERATE_TYPOS.contains(&name.as_str())
+                || is_kubernetes_service_link(&name)
             {
                 continue;
             }

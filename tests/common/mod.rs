@@ -139,6 +139,7 @@ pub fn config(amqp_url: &str, exchange: &str) -> Config {
     c.listen = "127.0.0.1:0".parse().unwrap();
     c.amqp_connection_name = unique("mpc-relay-test");
     c.shutdown_grace = Duration::ZERO;
+    c.drain_delay = Duration::ZERO;
     c
 }
 
@@ -567,6 +568,26 @@ impl Mgmt {
         )
     }
 
+    /// Poll until the queue has `want` consumers (the count is
+    /// statistics-based and lags by up to an emission interval). `None` if
+    /// the broker has statistics disabled.
+    pub async fn wait_consumer_count(
+        &self,
+        vhost: &str,
+        queue: &str,
+        want: usize,
+    ) -> Option<usize> {
+        let mut n = self.consumer_count(vhost, queue).await;
+        for _ in 0..120 {
+            if n.is_none_or(|n| n == want) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            n = self.consumer_count(vhost, queue).await;
+        }
+        n
+    }
+
     async fn send(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> u16 {
         let mut req = self
             .http
@@ -721,4 +742,95 @@ pub fn vhost(amqp_url: &str) -> String {
         .parse::<lapin::uri::AMQPUri>()
         .map(|u| u.vhost)
         .unwrap_or_else(|_| "/".into())
+}
+
+// ---- the relay as a separate process ----------------------------------------
+
+/// The real `mpc-relay` binary, as a child process: its own AMQP
+/// connections, its own exclusivity registry, real signals.
+pub struct RelayProcess {
+    child: std::process::Child,
+    pub addr: SocketAddr,
+}
+
+impl RelayProcess {
+    /// Start the binary with a clean environment plus `extra`, and wait
+    /// for `/readyz`.
+    pub async fn spawn(amqp_url: &str, exchange: &str, extra: &[(&str, &str)]) -> Self {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mpc-relay"));
+        cmd.env_clear()
+            .env("MPC_RELAY_LISTEN", addr.to_string())
+            .env("MPC_RELAY_AMQP_URL", amqp_url)
+            .env("MPC_RELAY_EXCHANGE", exchange)
+            .env("MPC_RELAY_JWT_SECRET", std::str::from_utf8(SECRET).unwrap())
+            .env("MPC_RELAY_AMQP_CONNECTION_NAME", unique("mpc-relay-proc"));
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        match std::env::var("MPC_RELAY_TEST_LOG") {
+            Ok(filter) => {
+                cmd.env("RUST_LOG", filter);
+            }
+            Err(_) => {
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+        }
+        let child = cmd.spawn().expect("spawn mpc-relay");
+        let mut p = RelayProcess { child, addr };
+        let http = reqwest::Client::new();
+        for _ in 0..200 {
+            if let Ok(r) = http.get(format!("http://{addr}/readyz")).send().await {
+                if r.status() == 200 {
+                    return p;
+                }
+            }
+            if let Ok(Some(status)) = p.child.try_wait() {
+                panic!("mpc-relay exited during startup: {status}");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("mpc-relay process did not become ready");
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn sigterm(&self) {
+        let ok = std::process::Command::new("kill")
+            .args(["-TERM", &self.pid().to_string()])
+            .status()
+            .expect("run kill")
+            .success();
+        assert!(ok, "kill -TERM failed");
+    }
+
+    /// Wait for the process to exit, up to `max`.
+    pub async fn wait_exit(&mut self, max: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = tokio::time::Instant::now() + max;
+        loop {
+            if let Ok(Some(s)) = self.child.try_wait() {
+                return Some(s);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+impl Drop for RelayProcess {
+    fn drop(&mut self) {
+        if let Ok(None) = self.child.try_wait() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }

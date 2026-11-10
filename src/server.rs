@@ -36,6 +36,13 @@ const WS_MESSAGE_SLACK: usize = 64 * 1024;
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// WebSocket read buffer per connection. tungstenite zero-fills its read
+/// buffer up to this size on every read, so it is resident memory for every
+/// open connection: axum's default of 128 KiB measured at ~160 KiB per idle
+/// session, 16 KiB at a fraction of that (see the README's Scaling section).
+/// Larger frames still work; they take more reads.
+const WS_READ_BUFFER: usize = 16 * 1024;
+
 /// Install the process-wide rustls crypto provider. Both `ring` (pulled in
 /// by lapin's TLS connector) and `aws-lc-rs` are compiled in, and rustls
 /// refuses to guess between them. Idempotent.
@@ -180,6 +187,7 @@ async fn readyz(State(shared): State<Arc<Shared>>) -> Response {
         "exchange": exchange,
         "keys": keys,
         "draining": draining,
+        "accepting": !shared.refusing.load(Ordering::Acquire),
         "amqp_connections": connections,
         "amqp_pool_cap": shared.pool.cap(),
     });
@@ -219,7 +227,7 @@ async fn ws_handler(
     headers: HeaderMap,
     mut ws: WebSocketUpgrade,
 ) -> Response {
-    if shared.draining.load(Ordering::Acquire) {
+    if shared.refusing.load(Ordering::Acquire) {
         shared.metrics.error("draining");
         return (StatusCode::SERVICE_UNAVAILABLE, "draining\n").into_response();
     }
@@ -243,6 +251,7 @@ async fn ws_handler(
     let metrics = shared.metrics.clone();
     ws.max_message_size(limit)
         .max_frame_size(limit)
+        .read_buffer_size(WS_READ_BUFFER)
         .on_failed_upgrade(move |e| {
             metrics.error("upgrade_failed");
             tracing::debug!(error = %e, "websocket upgrade failed");
@@ -278,6 +287,7 @@ pub async fn start(config: Config) -> anyhow::Result<Relay> {
             exchange: config.exchange.clone(),
             max_clients: config.limits.max_connections,
             max_connections: config.amqp_max_connections,
+            channels_per_connection: config.amqp_channels_per_connection,
         },
         metrics.clone(),
         stop_broker.clone(),
@@ -349,21 +359,47 @@ pub async fn start(config: Config) -> anyhow::Result<Relay> {
 }
 
 impl Relay {
-    /// Stop accepting, give clients `shutdown_grace` to leave on their own,
-    /// end the rest with ERROR "server shutting down", clean up their queues,
-    /// then close the broker connection.
+    /// Drain, then stop.
+    ///
+    /// 1. **Lame duck** (`drain_delay`): `/readyz` turns 503 at once, but new
+    ///    WebSockets are still accepted and served. A load balancer needs a
+    ///    probe interval or two to deregister an instance; refusing before it
+    ///    has would turn every connection it still routes here into a failed
+    ///    device. The listeners stay up throughout, so the balancer and the
+    ///    kubelet get answers (liveness stays 200), never refusals.
+    /// 2. **Drain** (`shutdown_grace`): new WebSockets are refused with HTTP
+    ///    503; open sessions carry on untouched and get this long to finish.
+    ///    It ends early once the last one has gone.
+    /// 3. Whoever is left gets ERROR "server shutting down", and their
+    ///    queues are deleted.
+    /// 4. Only then are the listeners closed and the AMQP connections shut.
+    ///
+    /// Worst case after the signal: `drain_delay` + `shutdown_grace` + 25 s
+    /// (sessions cleaning up 15 s, listeners 5 s, AMQP close 5 s).
     pub async fn shutdown(self) {
+        let delay = self.shared.config.drain_delay;
         let grace = self.shared.config.shutdown_grace;
         self.shared.draining.store(true, Ordering::Release);
-        self.drain.cancel();
         tracing::info!(
             active = self.shared.active_connections(),
+            ?delay,
             ?grace,
-            "draining"
+            "draining: /readyz is 503; still accepting new connections for the drain delay"
+        );
+        tokio::time::sleep(delay).await;
+        self.shared.refusing.store(true, Ordering::Release);
+        tracing::info!(
+            active = self.shared.active_connections(),
+            "drain delay over: refusing new connections; open sessions continue"
         );
         wait_for_idle(&self.shared, grace).await;
+        let left = self.shared.active_connections();
+        if left > 0 {
+            tracing::info!(remaining = left, "grace expired; ending remaining sessions");
+        }
         self.shared.shutdown.cancel();
         wait_for_idle(&self.shared, Duration::from_secs(15)).await;
+        self.drain.cancel();
         self.stop_broker.cancel();
         for s in self.servers {
             let _ = tokio::time::timeout(Duration::from_secs(5), s).await;

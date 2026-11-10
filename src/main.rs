@@ -4,7 +4,10 @@ use mpc_relay::config::{Config, KeySource, LogFormat};
 use tracing_subscriber::EnvFilter;
 
 fn init_tracing(format: &LogFormat) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // pinky_swear (lapin's promises) warns whenever a publisher confirm
+    // arrives after its waiter has gone, which is routine under load.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,pinky_swear=error"));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     match format {
         LogFormat::Json => builder.json().flatten_event(true).init(),

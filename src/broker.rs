@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lapin::options::ExchangeDeclareOptions;
+use lapin::protocol::{AMQPErrorKind, AMQPSoftError};
 use lapin::types::FieldTable;
 use lapin::{Connection, ConnectionProperties, ExchangeKind};
 use tokio::sync::{watch, Notify};
@@ -47,6 +48,16 @@ const EXCHANGE_RECHECK_PRESENT: Duration = Duration::from_secs(30);
 /// short-lived channels: the periodic exchange check, and the fallback
 /// channel cleanup opens when a session's own channel has died.
 pub const CHANNEL_MARGIN: usize = 2;
+/// Default cap on sessions per pooled connection: none beyond the
+/// broker's `channel_max` minus [`CHANNEL_MARGIN`].
+///
+/// Measured, one relay with 10 000 sessions (README, Scaling): capping at
+/// 512, 256 or 64 sessions per connection did not lower CPU per message, and
+/// each extra connection costs ~8 MiB, because lapin allocates two zeroed
+/// buffers of 32 x `frame_max` per connection. The cap is still useful to
+/// bound how many sessions one AMQP connection's loss can drop.
+pub const DEFAULT_CHANNELS_PER_CONNECTION: usize = u16::MAX as usize;
+
 /// Longest a CONNECT waits for a pooled connection that is still
 /// connecting.
 const ACQUIRE_WAIT: Duration = Duration::from_secs(10);
@@ -163,6 +174,9 @@ pub struct PoolSettings {
     pub max_clients: usize,
     /// `MPC_RELAY_AMQP_MAX_CONNECTIONS`: overrides the derived cap.
     pub max_connections: Option<usize>,
+    /// `MPC_RELAY_AMQP_CHANNELS_PER_CONNECTION`: sessions per connection,
+    /// at most (and never more than `channel_max` minus the margin).
+    pub channels_per_connection: usize,
 }
 
 pub struct Pool {
@@ -395,7 +409,10 @@ impl Pool {
                         0 => usize::from(u16::MAX),
                         n => usize::from(n),
                     };
-                    let capacity = channel_max.saturating_sub(CHANNEL_MARGIN).max(1);
+                    let capacity = channel_max
+                        .saturating_sub(CHANNEL_MARGIN)
+                        .min(self.settings.channels_per_connection)
+                        .max(1);
                     self.known_capacity.store(capacity, Ordering::Release);
                     tracing::info!(broker = %target, slot = index, generation, channel_max, capacity, cap = self.cap(), "connected to broker");
                     self.set_connected(1);
@@ -454,7 +471,16 @@ impl Pool {
         let mut next_check = tokio::time::Instant::now();
         loop {
             if tokio::time::Instant::now() >= next_check {
-                let ok = exchange_exists(conn, exchange).await;
+                let ok = match exchange_exists(conn, exchange).await {
+                    ExchangeCheck::Exists => true,
+                    ExchangeCheck::Missing => false,
+                    ExchangeCheck::Inconclusive(why) => {
+                        // Keep what we knew; ask again soon.
+                        tracing::warn!(slot = slot.index, exchange, why, "exchange check inconclusive (broker slow?); keeping the previous state");
+                        next_check = tokio::time::Instant::now() + EXCHANGE_RECHECK_MISSING;
+                        slot.state.borrow().exchange_ok
+                    }
+                };
                 let changed = slot.state.send_if_modified(|s| {
                     let changed = s.exchange_ok != ok;
                     s.exchange_ok = ok;
@@ -471,12 +497,15 @@ impl Pool {
                         );
                     }
                 }
-                next_check = tokio::time::Instant::now()
+                let at_least = tokio::time::Instant::now()
                     + if ok {
                         EXCHANGE_RECHECK_PRESENT
                     } else {
                         EXCHANGE_RECHECK_MISSING
                     };
+                if next_check < tokio::time::Instant::now() {
+                    next_check = at_least;
+                }
             }
             tokio::select! {
                 _ = lost.notified() => return false,
@@ -491,9 +520,35 @@ impl Pool {
     }
 }
 
+/// What a passive exchange declare established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExchangeCheck {
+    Exists,
+    /// The broker answered 404 NOT_FOUND.
+    Missing,
+    /// No definite answer: a timeout, or some other error. A slow, busy
+    /// broker produces these, and treating them as "missing" flips
+    /// `/readyz` off on every relay at the worst moment.
+    Inconclusive(String),
+}
+
+/// Classify the outcome of a passive declare (`None`: it timed out).
+pub fn classify_exchange_check(outcome: Option<lapin::Result<()>>) -> ExchangeCheck {
+    match outcome {
+        Some(Ok(())) => ExchangeCheck::Exists,
+        Some(Err(lapin::Error::ProtocolError(e)))
+            if *e.kind() == AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND) =>
+        {
+            ExchangeCheck::Missing
+        }
+        Some(Err(e)) => ExchangeCheck::Inconclusive(e.to_string()),
+        None => ExchangeCheck::Inconclusive("timed out".into()),
+    }
+}
+
 /// Passive declare on a throwaway channel: the broker closes that channel
 /// with 404 if the exchange is missing, which is why it is not a client's.
-pub async fn exchange_exists(conn: &Connection, exchange: &str) -> bool {
+pub async fn exchange_exists(conn: &Connection, exchange: &str) -> ExchangeCheck {
     let check = async {
         let ch = conn.create_channel().await?;
         let r = ch
@@ -512,14 +567,7 @@ pub async fn exchange_exists(conn: &Connection, exchange: &str) -> bool {
         }
         r
     };
-    match tokio::time::timeout(OP_TIMEOUT, check).await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            tracing::debug!(exchange, error = %e, "passive exchange declare failed");
-            false
-        }
-        Err(_) => false,
-    }
+    classify_exchange_check(tokio::time::timeout(OP_TIMEOUT, check).await.ok())
 }
 
 /// Up to +/-20% so a fleet of relays does not reconnect in lockstep.

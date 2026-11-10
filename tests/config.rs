@@ -66,6 +66,45 @@ fn unknown_variable_is_refused() {
 }
 
 #[test]
+fn kubernetes_service_links_are_not_mistaken_for_typos() {
+    // What Kubernetes injects for a Service named `mpc-relay` with ports
+    // ws (80 -> 8080) and metrics (9090), as observed in a real pod.
+    let mut vars = base();
+    for (k, v) in [
+        ("MPC_RELAY_SERVICE_HOST", "10.43.0.10"),
+        ("MPC_RELAY_SERVICE_PORT", "80"),
+        ("MPC_RELAY_SERVICE_PORT_WS", "80"),
+        ("MPC_RELAY_SERVICE_PORT_METRICS", "9090"),
+        ("MPC_RELAY_PORT", "tcp://10.43.0.10:80"),
+        ("MPC_RELAY_PORT_80_TCP", "tcp://10.43.0.10:80"),
+        ("MPC_RELAY_PORT_80_TCP_PROTO", "tcp"),
+        ("MPC_RELAY_PORT_80_TCP_PORT", "80"),
+        ("MPC_RELAY_PORT_80_TCP_ADDR", "10.43.0.10"),
+        ("MPC_RELAY_PORT_9090_TCP_PROTO", "tcp"),
+    ] {
+        vars.push((k, v.into()));
+    }
+    assert!(Config::from_vars(vars).is_ok());
+    // Near misses are still typos.
+    for typo in [
+        "MPC_RELAY_PORTS",
+        "MPC_RELAY_PORT_80",
+        "MPC_RELAY_PORT_80_HTTP",
+        "MPC_RELAY_PORT_X_TCP",
+        "MPC_RELAY_PORT_80_TCP_HOST",
+        "MPC_RELAY_SERVICE",
+        "MPC_RELAY_SERVICE_HOSTNAME",
+        "MPC_RELAY_LISTEN_PORT",
+    ] {
+        assert_eq!(
+            Config::from_vars(with(base(), typo, "x")).unwrap_err(),
+            ConfigError::Unknown(typo.into()),
+            "{typo}"
+        );
+    }
+}
+
+#[test]
 fn empty_value_is_refused() {
     let e = Config::from_vars(with(base(), "MPC_RELAY_JWT_AUDIENCE", "")).unwrap_err();
     assert_eq!(e, ConfigError::Empty("MPC_RELAY_JWT_AUDIENCE".into()));
@@ -325,4 +364,19 @@ fn amqp_max_connections() {
     assert_eq!(c.amqp_max_connections, Some(4));
     assert!(Config::from_vars(with(base(), "MPC_RELAY_AMQP_MAX_CONNECTIONS", "0")).is_err());
     assert!(Config::from_vars(with(base(), "MPC_RELAY_AMQP_MAX_CONNECTIONS", "many")).is_err());
+}
+
+#[test]
+fn drain_delay() {
+    let c = Config::from_vars(base()).unwrap();
+    assert_eq!(c.drain_delay, Duration::from_secs(5), "default");
+    let c = Config::from_vars(with(base(), "MPC_RELAY_DRAIN_DELAY", "0")).unwrap();
+    assert_eq!(
+        c.drain_delay,
+        Duration::ZERO,
+        "zero turns the lame duck off"
+    );
+    let c = Config::from_vars(with(base(), "MPC_RELAY_DRAIN_DELAY", "1500ms")).unwrap();
+    assert_eq!(c.drain_delay, Duration::from_millis(1500));
+    assert!(Config::from_vars(with(base(), "MPC_RELAY_DRAIN_DELAY", "soon")).is_err());
 }

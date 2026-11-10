@@ -83,6 +83,8 @@ Everything is configured through environment variables. The relay **refuses to s
 
 Durations take `500ms`, `10s`, `5m` or `1h`; a bare number means seconds.
 
+Kubernetes injects "service link" variables named after each Service in the namespace. A Service called `mpc-relay` gives the pod `MPC_RELAY_SERVICE_HOST`, `MPC_RELAY_PORT_9090_TCP_PROTO` and similar. Exactly those shapes are recognised and skipped rather than refused as typos. The shipped manifest also sets `enableServiceLinks: false`.
+
 ### Required
 
 | Variable | Meaning |
@@ -116,7 +118,8 @@ Durations take `500ms`, `10s`, `5m` or `1h`; a bare number means seconds.
 | `MPC_RELAY_METRICS_LISTEN` | – | Serve `/metrics` on this separate address (and not on the main listener). |
 | `MPC_RELAY_TLS_CERT`, `MPC_RELAY_TLS_KEY` | – | PEM certificate chain and private key: serve `wss://` directly. Usually TLS terminates at a load balancer instead. |
 | `MPC_RELAY_AMQP_CONNECTION_NAME` | `mpc-relay` | Client-provided connection name shown in the broker's UI; pooled connections are named `<name>#0`, `<name>#1`, and so on. |
-| `MPC_RELAY_AMQP_MAX_CONNECTIONS` | derived | Most AMQP connections the pool opens. By default it is derived so the pool can carry `MPC_RELAY_MAX_CONNECTIONS` clients: `ceil(MPC_RELAY_MAX_CONNECTIONS / (channel_max - 2))`, which is 5 with RabbitMQ's default `channel_max` of 2047. |
+| `MPC_RELAY_AMQP_CHANNELS_PER_CONNECTION` | unlimited | Most client sessions placed on one pooled AMQP connection (each needs one channel). Never more than the broker's `channel_max` minus 2, which is also the default. Lower it to bound how many sessions one AMQP connection's loss drops; each extra connection costs about 8 MiB (see [Scaling](#scaling)). |
+| `MPC_RELAY_AMQP_MAX_CONNECTIONS` | derived | Most AMQP connections the pool opens. By default it is derived so the pool can carry `MPC_RELAY_MAX_CONNECTIONS` clients: `ceil(MPC_RELAY_MAX_CONNECTIONS / sessions per connection)`, which is 5 with the defaults and RabbitMQ's default `channel_max` of 2047. |
 
 ### Limits
 
@@ -132,7 +135,8 @@ Durations take `500ms`, `10s`, `5m` or `1h`; a bare number means seconds.
 | `MPC_RELAY_PING_INTERVAL` | `20s` | WebSocket ping interval. Must be shorter than the idle timeout. |
 | `MPC_RELAY_WRITE_TIMEOUT` | `30s` | Give up on a client that does not accept data for this long. |
 | `MPC_RELAY_PREFETCH` | `64` | AMQP prefetch per subscription: deliveries in flight towards one client before the broker holds the rest. |
-| `MPC_RELAY_SHUTDOWN_GRACE` | `20s` | On SIGTERM, how long clients get to leave by themselves before being told `server shutting down`. |
+| `MPC_RELAY_DRAIN_DELAY` | `5s` | On SIGTERM, how long the relay stays a "lame duck": `/readyz` is already 503, but new connections are still accepted and served, so the load balancer can deregister it before it starts refusing. `0` refuses at once. |
+| `MPC_RELAY_SHUTDOWN_GRACE` | `20s` | After the drain delay, how long open sessions get to finish by themselves (new connections are refused meanwhile) before the rest are told `server shutting down`. |
 
 ### Logging
 
@@ -255,24 +259,82 @@ A device can send `SUBSCRIBE` (broadcast) then `SUBSCRIBE` (unicast, with `recei
 | `GET /readyz` | 200 when at least one pooled AMQP connection is up and sees the exchange (checked with a passive declare on connect and periodically), JWKS keys are loaded, and the relay is not draining. Otherwise 503. The JSON body says which condition failed, how many AMQP connections are open, and the pool's cap. |
 | `GET /metrics` | Prometheus text format, on the main listener or on `MPC_RELAY_METRICS_LISTEN`. |
 
-Metrics: `mpc_relay_connections_active`, `mpc_relay_connections_total`, `mpc_relay_auth_failures_total{reason}`, `mpc_relay_frames_total{direction,command}`, `mpc_relay_publishes_total`, `mpc_relay_deliveries_total`, `mpc_relay_errors_total{reason}`, `mpc_relay_broker_connected` (1 while any pooled connection is up), plus `mpc_relay_amqp_connections` (open), `mpc_relay_amqp_pool_size` (opened so far) and `mpc_relay_amqp_channels_in_use` (sessions placed). Label values come from fixed sets, never from client input.
+Metrics: `mpc_relay_connections_active`, `mpc_relay_connections_total`, `mpc_relay_auth_failures_total{reason}`, `mpc_relay_frames_total{direction,command}`, `mpc_relay_publishes_total`, `mpc_relay_deliveries_total`, `mpc_relay_errors_total{reason}`, `mpc_relay_broker_connected` (1 while any pooled connection is up), plus `mpc_relay_amqp_connections` (open), `mpc_relay_amqp_pool_size` (opened so far) and `mpc_relay_amqp_channels_in_use` (sessions placed), and `mpc_relay_publish_nacks_total`. Label values come from fixed sets, never from client input.
+
+`mpc_relay_publish_nacks_total` counts negative publisher confirms. It is not an error count: a trickle when sessions end is expected. A device's exclusive queue is deleted while a broadcast addressed to it is still being routed; the broker nacks that publish, and the peers still running receive it anyway.
 
 **Broker loss.** Each pooled connection is supervised on its own. When one drops, exactly the clients placed on it get `ERROR broker unavailable` and are closed; clients on the other connections are untouched. The lost connection reconnects independently with capped exponential backoff (0.5 s doubling to 30 s, with jitter). `/readyz` turns 503 only when no connection is up. Devices reconnect and resubscribe; their old exclusive queues died with the old connection.
 
-**Shutdown** (SIGTERM or SIGINT). `/readyz` turns 503 and new WebSockets are refused. Connected clients get `MPC_RELAY_SHUTDOWN_GRACE` to finish on their own. The rest receive `ERROR server shutting down`. Their queues are deleted, and the AMQP connection is closed.
+**Shutdown** (SIGTERM or SIGINT) happens in four steps:
+
+1. **Lame duck**, for `MPC_RELAY_DRAIN_DELAY` (5 s). `/readyz` turns 503 within milliseconds, but new WebSockets are still accepted and served. A load balancer needs a probe interval or two to stop routing here, and a connection it routes in that window must not fail: a device that cannot connect can leave its whole cohort waiting.
+2. **Drain**, for up to `MPC_RELAY_SHUTDOWN_GRACE`. New WebSockets get HTTP 503; open sessions carry on untouched. The drain ends early once the last session has gone.
+3. Sessions still open get `ERROR server shutting down`, and their queues are deleted.
+4. The listeners close and the AMQP connections are shut.
+
+The HTTP listener stays up throughout, so probes get answers (liveness stays 200), not refusals. The worst case after SIGTERM is drain delay + grace + 25 s, so set Kubernetes' `terminationGracePeriodSeconds` to at least that plus a margin: 60 s for the manifest's 5 s + 25 s. A `preStop` sleep is an alternative to the drain delay. The relay only learns of the termination when the sleep ends, so set `MPC_RELAY_DRAIN_DELAY=0` and count the sleep in the termination grace instead.
 
 ## Scaling
 
 The relay is stateless. Run as many instances as you like behind any TCP or HTTP load balancer that supports WebSockets.
 
 * A client is pinned to the instance that accepted its WebSocket for the life of that connection. No sticky sessions or shared state are needed.
-* A device that reconnects may land anywhere. Exclusivity of a session queue across instances is enforced by the broker itself.
+* A device that reconnects may land anywhere. Exclusivity of a session queue across instances is enforced by the broker itself (tested: a second instance asking for a held queue gets `ERROR resource locked`).
 * Set the load balancer's idle timeout above `MPC_RELAY_PING_INTERVAL`. The relay's pings are the traffic that keeps idle WebSockets open.
-* Each client session needs **one AMQP channel**, and one AMQP connection carries at most the broker's `channel_max` channels (2047 by default on RabbitMQ). So each instance keeps a **pool** of AMQP connections:
-  * The first is opened at startup and the rest lazily, when every live connection is full.
-  * A session goes on the first live connection with a free channel. Two channels per connection are kept back for the relay's own short-lived channels.
-  * The pool is capped so its total capacity matches `MPC_RELAY_MAX_CONNECTIONS`, or at `MPC_RELAY_AMQP_MAX_CONNECTIONS` if set. When every connection it may open is full, CONNECT is answered with `ERROR too many connections`.
-  * The negotiated `channel_max`, per-connection capacity and cap are logged as each connection opens. Mind the broker's own per-user or per-vhost connection limits when sizing.
+* Scaling **out** adds capacity for new connections only; open WebSockets stay where they are. Scaling **in** drains an instance (see [Operations](#operations)): its clients finish or are told to reconnect elsewhere. So scale in slowly.
+
+### Measured
+
+One relay instance (the distroless image, `linux/arm64`), RabbitMQ 4.4 and the load generator, each in its own container on one 8-vCPU, 8 GB Docker VM on Apple silicon. They all share those CPUs, so throughput is a floor, not a ceiling. Each "session" is one device as an MPC device behaves: a WebSocket, a CONNECT with its own JWT, and two SUBSCRIBEs sharing one `x-queue-name`, so one exclusive queue, two bindings and two consumers on the broker. Messages are 1 KiB. The relay's CPU time and resident memory are read from `/proc`. Reproduce with [`examples/load.rs`](examples/load.rs).
+
+| Sessions held open | Connect (all sessions) | Memory per idle session | Idle CPU | Relay CPU per delivered message | Relay CPU per published message |
+|---|---|---|---|---|---|
+| 1 000 | 1.1 s, handshake p99 414 ms | 45.8 KiB | – | 102 µs | 56 µs |
+| 5 000 | 3.9 s, p99 337 ms | 33.8 KiB¹ | 6 % of a core | 96 µs | 107 µs |
+| **10 000** | 10.2–11.8 s, p99 495–532 ms, **0 failures** | **47.4 KiB** (RSS 14 → 477 MiB) | 9–12 % of a core | 279–342 µs | 198–257 µs |
+
+¹ Measured on an already-warm process; take 47 KiB as the figure to size with.
+
+Delivered message: a raw AMQP publish to a device's unicast key, ending as one MESSAGE frame. Published message: a SEND from a device, published to the exchange. Throughput on this shared machine was 10 000–14 000 deliveries/s and 9 000–13 000 publishes/s per instance up to 5 000 sessions, and 3 500–4 300 deliveries/s and 5 000–7 700 publishes/s with 10 000 sessions open.
+
+What the numbers mean:
+
+* **Memory** is about 14 MiB + 47 KiB per open session + 8 MiB per pooled AMQP connection, plus in-flight messages. 10 000 idle sessions are under 500 MiB. (The 47 KiB includes a 16 KiB WebSocket read buffer. With the library default of 128 KiB it measured 161 KiB per session, so the relay sets it explicitly.)
+* **An idle connection costs almost no CPU**: about 1 % of a core per 1 000, mostly the 20 s pings. Connections cost memory; messages cost CPU.
+* **CPU per message is about 0.1 ms up to 5 000 sessions per instance**, roughly 10 000 messages per second per core. With 10 000 sessions on one instance it rises 2–3×. A profile puts that time in the AMQP client's per-connection IO loop, which does per-frame work proportional to the channels on the connection. Spreading the same sessions over more AMQP connections was measured and made it worse, because every extra connection costs about 8 MiB and its own IO thread:
+
+  | Sessions per AMQP connection (`MPC_RELAY_AMQP_CHANNELS_PER_CONNECTION`) | AMQP connections | Memory per session | CPU per delivered message |
+  |---|---|---|---|
+  | 2 045 (default: `channel_max` − 2) | 5 | 47.4 KiB | 279 µs |
+  | 512 | 20 | 59.5 KiB | 318 µs |
+  | 256 | 40 | 75.4 KiB | 376 µs |
+  | 64 | 157 | 167.5 KiB | 1 569 µs |
+
+  So keep the default packing, and scale out rather than up. For message-heavy traffic, plan for about 5 000 sessions per instance.
+
+### What to scale on
+
+* **CPU** is the default signal (the HPA in [`deploy/kubernetes.yaml`](deploy/kubernetes.yaml): 60 % of a 500m request). Message traffic is what costs CPU, and CPU rises before latency does.
+* **Open connections per pod** (`mpc_relay_connections_active`, through a Prometheus adapter; commented out in the manifest) tracks memory and keeps instances in the range measured above. Target a few thousand per pod. `MPC_RELAY_MAX_CONNECTIONS` remains the hard per-instance limit.
+* **Size memory** as 14 MiB + 47 KiB × sessions + 8 MiB × AMQP connections, plus headroom for messages in flight. Prefetch is 64 per subscription, so a slow client can have up to 128 of its messages in the relay.
+* **The broker scales too.** Every session is an exclusive queue, two bindings and two consumers. With many relay instances, the broker is usually what runs out first.
+
+### Autoscaling on Kubernetes, verified
+
+[`deploy/kubernetes.yaml`](deploy/kubernetes.yaml) was applied unchanged to a k3s v1.31 cluster, except for the image, real secrets, a NodePort, and a shorter scale-down window so scale-in showed within minutes. It ran there under eight waves of 1 500 fresh devices each: CONNECT, two SUBSCRIBEs, 100 000 deliveries and 99 000 publishes per wave.
+
+* The HPA scaled out on CPU (2 → 4 → 5 replicas, again 3 → 5 later) and back in to 2 when idle.
+* All 12 000 device connections succeeded while pods were added and drained around them.
+* With RabbitMQ in the same small cluster, the broker became the bottleneck in the later waves, not the relays.
+
+### AMQP connection pool
+
+Each client session needs **one AMQP channel**, and one AMQP connection carries at most the broker's `channel_max` channels (2047 by default on RabbitMQ). So each instance keeps a **pool** of AMQP connections:
+
+* The first is opened at startup and the rest lazily, when every live connection is full.
+* A session goes on the first live connection with a free channel. Two channels per connection are kept back for the relay's own short-lived channels.
+* The pool is capped so its total capacity matches `MPC_RELAY_MAX_CONNECTIONS`, or at `MPC_RELAY_AMQP_MAX_CONNECTIONS` if set. When every connection it may open is full, CONNECT is answered with `ERROR too many connections`.
+* The negotiated `channel_max`, per-connection capacity and cap are logged as each connection opens. Mind the broker's own per-user or per-vhost connection limits when sizing.
 
 ## Limitations
 
@@ -302,6 +364,19 @@ cargo test
 The broker tests run only when `MPC_RELAY_TEST_AMQP_URL` is set. Once it is set, an unreachable broker fails them rather than skipping. `MPC_RELAY_TEST_MGMT_URL` adds management-API assertions (queue flags, bindings, consumer counts where the broker exposes statistics) and the broker-loss test. `MPC_RELAY_TEST_LOG=mpc_relay=debug` prints the relay's logs.
 
 Layout: `src/codec.rs` (STOMP framing), `src/auth.rs` (JWT), `src/acl.rs` (what a token may do), `src/bridge.rs` (one session onto one AMQP channel), `src/broker.rs` (the AMQP connection), `src/server.rs` (HTTP, WebSocket, TLS, lifecycle), `src/config.rs`, `src/metrics.rs`, `src/main.rs`.
+
+## Releasing
+
+Publishing a GitHub release is the only thing that ships an image ([`.github/workflows/release.yml`](.github/workflows/release.yml)).
+
+1. Create a GitHub release whose **tag is the version**, `vMAJOR.MINOR.PATCH` with an optional `-pre.release` suffix (`v0.2.0`, `v1.0.0-rc.1`). Its **title is that tag and nothing else**. The body is a human-readable changelog grouped by theme (features, fixes, breaking changes), written for the people who run the relay. Tick *Set as a pre-release* for anything that must not become `:latest`.
+2. On publish, the workflow:
+   * rejects a tag that is not `vMAJOR.MINOR.PATCH[-pre]`, since an image tagged with a typo cannot be un-published;
+   * runs the pull-request gate ([`ci.yml`](.github/workflows/ci.yml)) against the tagged tree: fmt, clippy, the tests with a RabbitMQ service container, and an image build. If it fails, nothing ships;
+   * stamps the version into `Cargo.toml` and into this crate's entry in `Cargo.lock`, so `mpc-relay --version` and the `server` header of `CONNECTED` report it. Nobody bumps `Cargo.toml` by hand: the tag is the version;
+   * builds `linux/amd64` and `linux/arm64` on native runners (not QEMU), pushes them by digest, and assembles one multi-arch index tagged `ghcr.io/zafeguard/mpc-relay:<tag>` (`v1.2.3`), `:<version>` (`1.2.3`), and `:latest` for non-pre-releases only;
+   * writes a release summary.
+3. To re-run for an existing tag (a missed release event, say), dispatch the workflow by hand with that tag. It is treated as a pre-release, so it never moves `:latest`.
 
 ## License
 

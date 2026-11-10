@@ -372,3 +372,41 @@ async fn sub_pattern_is_checked_at_connect() {
     assert_eq!(err.header("message"), Some("broker unavailable"));
     r.shutdown().await;
 }
+
+/// Only a definite 404 means the exchange is missing. A slow or failing
+/// broker must not flip readiness off: that once took relay pods out of
+/// service in the middle of a load test while their sessions were fine.
+#[test]
+fn exchange_check_is_only_missing_on_a_definite_404() {
+    use lapin::protocol::{AMQPError, AMQPErrorKind, AMQPHardError, AMQPSoftError};
+    use mpc_relay::broker::{classify_exchange_check, ExchangeCheck};
+    assert_eq!(classify_exchange_check(Some(Ok(()))), ExchangeCheck::Exists);
+    let not_found = lapin::Error::ProtocolError(AMQPError::new(
+        AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND),
+        "NOT_FOUND - no exchange 'mpc.cohort' in vhost '/'".into(),
+    ));
+    assert_eq!(
+        classify_exchange_check(Some(Err(not_found))),
+        ExchangeCheck::Missing
+    );
+    for e in [
+        lapin::Error::ProtocolError(AMQPError::new(
+            AMQPErrorKind::Soft(AMQPSoftError::ACCESSREFUSED),
+            "ACCESS_REFUSED".into(),
+        )),
+        lapin::Error::ProtocolError(AMQPError::new(
+            AMQPErrorKind::Hard(AMQPHardError::CONNECTIONFORCED),
+            "CONNECTION_FORCED".into(),
+        )),
+        lapin::Error::ChannelsLimitReached,
+    ] {
+        assert!(matches!(
+            classify_exchange_check(Some(Err(e))),
+            ExchangeCheck::Inconclusive(_)
+        ));
+    }
+    assert!(matches!(
+        classify_exchange_check(None),
+        ExchangeCheck::Inconclusive(_)
+    ));
+}

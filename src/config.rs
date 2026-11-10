@@ -23,6 +23,7 @@ pub const KNOWN_VARS: &[&str] = &[
     "MPC_RELAY_AMQP_URL",
     "MPC_RELAY_AMQP_CONNECTION_NAME",
     "MPC_RELAY_AMQP_MAX_CONNECTIONS",
+    "MPC_RELAY_AMQP_CHANNELS_PER_CONNECTION",
     "MPC_RELAY_EXCHANGE",
     "MPC_RELAY_AUTH",
     "MPC_RELAY_JWT_SECRET",
@@ -46,6 +47,7 @@ pub const KNOWN_VARS: &[&str] = &[
     "MPC_RELAY_PING_INTERVAL",
     "MPC_RELAY_PREFETCH",
     "MPC_RELAY_SHUTDOWN_GRACE",
+    "MPC_RELAY_DRAIN_DELAY",
     "MPC_RELAY_LOG_FORMAT",
 ];
 
@@ -170,9 +172,16 @@ pub struct Config {
     /// `MPC_RELAY_AMQP_MAX_CONNECTIONS`: overrides the pool cap derived
     /// from `max_connections` and the broker's `channel_max`.
     pub amqp_max_connections: Option<usize>,
+    /// `MPC_RELAY_AMQP_CHANNELS_PER_CONNECTION`: most sessions placed on one
+    /// pooled AMQP connection, below the broker's `channel_max`.
+    pub amqp_channels_per_connection: usize,
     pub exchange: String,
     pub auth: AuthConfig,
     pub limits: Limits,
+    /// Lame-duck period after SIGTERM: `/readyz` is already 503, but new
+    /// connections are still accepted, so the load balancer can deregister
+    /// the instance before it starts refusing.
+    pub drain_delay: Duration,
     pub shutdown_grace: Duration,
     pub log_format: LogFormat,
 }
@@ -193,6 +202,7 @@ impl Config {
             amqp_url: amqp_url.into(),
             amqp_connection_name: "mpc-relay".into(),
             amqp_max_connections: None,
+            amqp_channels_per_connection: crate::broker::DEFAULT_CHANNELS_PER_CONNECTION,
             exchange: exchange.into(),
             auth: AuthConfig {
                 source,
@@ -203,6 +213,7 @@ impl Config {
                 sub_pattern: None,
             },
             limits: Limits::default(),
+            drain_delay: Duration::from_secs(5),
             shutdown_grace: Duration::from_secs(20),
             log_format: LogFormat::Text,
         }
@@ -228,7 +239,7 @@ impl Config {
         let mut env = BTreeMap::new();
         for (k, v) in vars {
             let (k, v) = (k.into(), v.into());
-            if !k.starts_with("MPC_RELAY_") {
+            if !k.starts_with("MPC_RELAY_") || is_kubernetes_service_link(&k) {
                 continue;
             }
             if !KNOWN_VARS.contains(&k.as_str()) {
@@ -379,6 +390,11 @@ impl Config {
         if let Some(v) = get("MPC_RELAY_AMQP_CONNECTION_NAME") {
             cfg.amqp_connection_name = v;
         }
+        cfg.amqp_channels_per_connection = positive(
+            &env,
+            "MPC_RELAY_AMQP_CHANNELS_PER_CONNECTION",
+            cfg.amqp_channels_per_connection,
+        )?;
         if env.contains_key("MPC_RELAY_AMQP_MAX_CONNECTIONS") {
             cfg.amqp_max_connections =
                 Some(positive(&env, "MPC_RELAY_AMQP_MAX_CONNECTIONS", 1usize)?);
@@ -424,6 +440,7 @@ impl Config {
             ));
         }
         cfg.shutdown_grace = duration_or(&env, "MPC_RELAY_SHUTDOWN_GRACE", cfg.shutdown_grace)?;
+        cfg.drain_delay = duration_or(&env, "MPC_RELAY_DRAIN_DELAY", cfg.drain_delay)?;
         cfg.log_format = match get("MPC_RELAY_LOG_FORMAT").as_deref() {
             None | Some("text") => LogFormat::Text,
             Some("json") => LogFormat::Json,
@@ -436,6 +453,39 @@ impl Config {
         };
         Ok(cfg)
     }
+}
+
+/// Kubernetes injects "service link" variables for every Service in the
+/// namespace, named after it: a Service called `mpc-relay` gives the pod
+/// `MPC_RELAY_SERVICE_HOST`, `MPC_RELAY_SERVICE_PORT`,
+/// `MPC_RELAY_SERVICE_PORT_<NAME>`, `MPC_RELAY_PORT` and
+/// `MPC_RELAY_PORT_<n>_<TCP|UDP|SCTP>[_PROTO|_PORT|_ADDR]`. They share this
+/// relay's prefix, and treating them as typos would make the relay refuse
+/// to start under the most natural Service name. Exactly these shapes are
+/// skipped; no relay variable has one, so a misspelt relay variable is
+/// still refused.
+pub fn is_kubernetes_service_link(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("MPC_RELAY_") else {
+        return false;
+    };
+    if rest == "SERVICE_HOST" || rest == "SERVICE_PORT" || rest == "PORT" {
+        return true;
+    }
+    if let Some(port_name) = rest.strip_prefix("SERVICE_PORT_") {
+        return !port_name.is_empty();
+    }
+    let Some(tail) = rest.strip_prefix("PORT_") else {
+        return false;
+    };
+    let mut parts = tail.splitn(3, '_');
+    let (Some(num), Some(proto)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let suffix = parts.next();
+    !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
+        && matches!(proto, "TCP" | "UDP" | "SCTP")
+        && matches!(suffix, None | Some("PROTO") | Some("PORT") | Some("ADDR"))
 }
 
 /// Compile a `sub` pattern so it must match the whole value: wrapped as

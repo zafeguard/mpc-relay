@@ -118,7 +118,10 @@ pub struct Shared {
     pub registry: QueueRegistry,
     /// Cancelled to end every client session ("server shutting down").
     pub shutdown: CancellationToken,
+    /// Set at SIGTERM: `/readyz` answers 503.
     pub draining: AtomicBool,
+    /// Set once the drain delay has passed: new WebSockets are refused.
+    pub refusing: AtomicBool,
     next_conn_id: AtomicU64,
     active: AtomicUsize,
 }
@@ -138,6 +141,7 @@ impl Shared {
             registry: QueueRegistry::default(),
             shutdown: CancellationToken::new(),
             draining: AtomicBool::new(false),
+            refusing: AtomicBool::new(false),
             next_conn_id: AtomicU64::new(1),
             active: AtomicUsize::new(0),
         }
@@ -689,17 +693,28 @@ pub async fn serve(ws: WebSocket, shared: Arc<Shared>, slot: ConnectionSlot, pee
             match stream.next().await {
                 None | Some(Ok(Message::Close(_))) => break,
                 Some(Ok(_)) => continue,
-                // After a read error (an oversized message, say) the stream
-                // cannot be drained, and closing now would reset the
-                // connection under the ERROR the client has not read yet.
-                // Hold it open for the rest of the linger instead.
-                Some(Err(_)) => pending::<()>().await,
+                // An oversized message: the client may still be writing it,
+                // the stream cannot be drained, and closing now would reset
+                // the connection under the ERROR it has not read yet. Hold it
+                // open for the rest of the linger instead.
+                Some(Err(e)) if is_capacity_error(&e) => pending::<()>().await,
+                // Any other read error means the peer is gone: nothing to
+                // wait for, and waiting would only hold up a drain.
+                Some(Err(_)) => break,
             }
         }
     })
     .await;
     let _ = tokio::time::timeout(limits.write_timeout + Duration::from_secs(1), writer).await;
     drop(slot);
+}
+
+/// A WebSocket message or frame over the configured size.
+fn is_capacity_error(e: &axum::Error) -> bool {
+    matches!(
+        std::error::Error::source(e).and_then(|s| s.downcast_ref::<tungstenite::Error>()),
+        Some(tungstenite::Error::Capacity(_))
+    )
 }
 
 fn negotiate_version(accept: Option<&str>) -> Option<&'static str> {
@@ -1300,12 +1315,13 @@ impl Session {
             // the broker's publisher confirm.
             match tokio::time::timeout(OP_TIMEOUT, confirm).await {
                 Ok(Ok(Confirmation::Nack(_))) => {
+                    self.shared.metrics.publish_nacks.inc();
                     return fail(
                         "broker_error",
                         "publish rejected",
                         "the broker refused the message",
                         &receipt,
-                    )
+                    );
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => return broker_failure(BrokerOpError::Amqp(e), &receipt),
@@ -1319,8 +1335,11 @@ impl Session {
                 if let Ok(Ok(Confirmation::Nack(_))) =
                     tokio::time::timeout(OP_TIMEOUT, confirm).await
                 {
-                    metrics.error("publish_nack");
-                    tracing::warn!(conn, "broker nacked a publish sent without receipt");
+                    // Not an error count: a trickle is expected at session
+                    // teardown, when a device's exclusive queue is deleted
+                    // while a broadcast to it is still being routed.
+                    metrics.publish_nacks.inc();
+                    tracing::debug!(conn, "broker nacked a publish sent without receipt");
                 }
             });
         }

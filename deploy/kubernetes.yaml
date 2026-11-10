@@ -10,7 +10,14 @@
 # life, so no session affinity is needed. Set the load balancer's idle
 # timeout above MPC_RELAY_PING_INTERVAL (default 20s): the relay pings every
 # client at that interval, and that traffic is what keeps an idle WebSocket
-# open through the balancer.
+# open through the balancer. If the balancer health-checks its targets
+# itself (an AWS ALB target group, say), point that check at /readyz too.
+#
+# Replicas are managed by the HorizontalPodAutoscaler below, which is why
+# the Deployment sets no `replicas:` (one would fight the autoscaler on
+# every apply). Scaling up adds capacity for NEW connections only: an open
+# WebSocket stays where it is. Scaling down drains a pod: its clients are
+# told "server shutting down" and reconnect elsewhere, so it is kept slow.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -34,7 +41,6 @@ metadata:
   labels:
     app.kubernetes.io/name: mpc-relay
 spec:
-  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: mpc-relay
@@ -52,10 +58,31 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: /metrics
     spec:
-      # Longer than MPC_RELAY_SHUTDOWN_GRACE (20s) plus cleanup, so a
-      # rolling update drains clients instead of killing them.
-      terminationGracePeriodSeconds: 45
+      # On SIGTERM the relay drains in two steps:
+      #   1. MPC_RELAY_DRAIN_DELAY (5s): /readyz turns 503 at once, but new
+      #      WebSockets are still accepted ("lame duck"), so connections the
+      #      Service / load balancer routes here before it has deregistered
+      #      the pod still succeed;
+      #   2. MPC_RELAY_SHUTDOWN_GRACE (25s): new WebSockets get HTTP 503, open
+      #      sessions run on; whoever is left at the end gets ERROR "server
+      #      shutting down". It ends early once the last session has gone.
+      # Then up to 25s more (session cleanup 15s, listeners 5s, AMQP close
+      # 5s). So:
+      #   terminationGracePeriodSeconds >= drain delay + grace + 25s + margin
+      #                                  = 5 + 25 + 25 + 5 = 60
+      # Keep them in step if you change either variable.
+      #
+      # Alternative to the drain delay: a preStop hook that sleeps (Kubernetes
+      # 1.30+ `lifecycle: {preStop: {sleep: {seconds: 5}}}`; the image has no
+      # shell for `exec: sleep`). The relay only learns of the termination
+      # when the sleep ends, so set MPC_RELAY_DRAIN_DELAY=0 then, and count
+      # the sleep in terminationGracePeriodSeconds instead.
+      terminationGracePeriodSeconds: 60
       automountServiceAccountToken: false
+      # Kubernetes would otherwise inject MPC_RELAY_SERVICE_HOST,
+      # MPC_RELAY_PORT_9090_TCP_PROTO and friends for the Service below. The
+      # relay knows to skip those, but nothing needs them.
+      enableServiceLinks: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -76,6 +103,10 @@ spec:
               value: 0.0.0.0:8080
             - name: MPC_RELAY_METRICS_LISTEN
               value: 0.0.0.0:9090      # keeps /metrics off the public port
+            - name: MPC_RELAY_DRAIN_DELAY
+              value: 5s
+            - name: MPC_RELAY_SHUTDOWN_GRACE
+              value: 25s
             - name: MPC_RELAY_LOG_FORMAT
               value: json
             - name: MPC_RELAY_JWT_MAX_TTL
@@ -99,20 +130,36 @@ spec:
             periodSeconds: 10
             failureThreshold: 3
           readinessProbe:
-            # Ready = broker connected, exchange present, signing keys loaded,
-            # not draining. A replica that cannot reach the broker stops
-            # receiving new clients.
+            # Ready = an AMQP connection up with the exchange present, signing
+            # keys loaded, and not draining. /readyz answers 503 within
+            # milliseconds of SIGTERM (the listener stays up while draining,
+            # so this probe gets an answer rather than a refusal). Two failed
+            # probes 2s apart take the pod out of the Service's endpoints
+            # within ~4s - inside the 5s drain delay, during which the relay
+            # still accepts whatever is routed to it - while one slow probe
+            # on a busy node does not. Kubernetes also marks a terminating
+            # pod's endpoints not-ready on its own; the probe covers balancers
+            # that only look at it.
             httpGet:
               path: /readyz
               port: ws
-            periodSeconds: 5
+            periodSeconds: 2
+            timeoutSeconds: 2
             failureThreshold: 2
+            successThreshold: 1
+          # Sized from the README's measurements: ~0.1 ms of CPU per message;
+          # memory ~14 MiB + 47 KiB per open session + 8 MiB per AMQP
+          # connection. The HPA below scales on CPU relative to the request,
+          # so the request is the per-pod budget it keeps under 60%.
+          # 256Mi covers ~5 000 idle sessions; the 1Gi limit covers the
+          # 10 000 measured on one instance, with headroom for messages in
+          # flight.
           resources:
             requests:
-              cpu: 100m
-              memory: 64Mi
+              cpu: 500m
+              memory: 256Mi
             limits:
-              memory: 512Mi
+              memory: 1Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -135,3 +182,81 @@ spec:
     - name: metrics
       port: 9090
       targetPort: metrics
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mpc-relay
+  labels:
+    app.kubernetes.io/name: mpc-relay
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mpc-relay
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    # CPU tracks message traffic, which is what costs the relay CPU: ~0.1 ms
+    # per message, while 1 000 idle connections cost ~1% of a core (README,
+    # Scaling).
+    # Utilisation is relative to the container's CPU *request* above.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+    # Alternative, or addition: open WebSockets per pod, which tracks memory.
+    # Needs the metric in the custom metrics API, e.g. prometheus-adapter
+    # with a rule such as:
+    #
+    #   rules:
+    #     - seriesQuery: 'mpc_relay_connections_active{namespace!="",pod!=""}'
+    #       resources: {overrides: {namespace: {resource: namespace}, pod: {resource: pod}}}
+    #       name: {as: "mpc_relay_connections_active"}
+    #       metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)'
+    #
+    # - type: Pods
+    #   pods:
+    #     metric:
+    #       name: mpc_relay_connections_active
+    #     target:
+    #       type: AverageValue
+    #       averageValue: "2500"   # ~120 MiB of sessions per pod
+  behavior:
+    scaleUp:
+      # React fast: new connections only land on pods that exist.
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+    scaleDown:
+      # Slowly, one pod at a time: removing a pod disconnects its clients
+      # (they reconnect elsewhere), so avoid doing it on a passing dip.
+      stabilizationWindowSeconds: 300
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mpc-relay
+  labels:
+    app.kubernetes.io/name: mpc-relay
+spec:
+  # Voluntary disruptions (node drains, cluster upgrades) take one relay pod
+  # at a time, each draining as on any SIGTERM. With minReplicas 2 there is
+  # always one serving.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mpc-relay
